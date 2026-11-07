@@ -1,0 +1,42 @@
+{
+  "name": "soli-backend",
+  "version": "1.0.0",
+  "description": "Soli Legal AI Platform - Standalone High-Performance Backend Service",
+  "private": true,
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\""
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "dependencies": {
+    "@composio/core": "0.27.0",
+    "@hono/node-server": "^1.13.8",
+    "@qdrant/js-client-rest": "^1.19.0",
+    "bcryptjs": "^3.0.3",
+    "croner": "^9.0.0",
+    "docx": "^9.10.0",
+    "dotenv": "^16.4.7",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.7.4",
+    "jose": "^5.9.6",
+    "openai": "^4.73.0",
+    "pdf-lib": "^1.17.1",
+    "postgres": "^3.4.9",
+    "unpdf": "^1.8.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

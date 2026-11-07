@@ -1,0 +1,5 @@
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@modelcontextprotocol/client@2.4.0'
+  - '@modelcontextprotocol/core@2.4.0'
