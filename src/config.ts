@@ -8,7 +8,7 @@ export const config = {
   logLevel: process.env.LOG_LEVEL || "debug",
 
   // CORS Origins
-  corsOrigins: (process.env.CORS_ORIGINS || "http://localhost:3000,http://localhost:3100,http://localhost:3200").split(",").map(s => s.trim()),
+  corsOrigins: (process.env.CORS_ORIGINS || "http://localhost:3000,http://localhost:3100,http://localhost:3200").split(",").map(s => s.trim().replace(/\/$/, "")),
   webUrl: (process.env.SOLI_WEB_URL || "http://localhost:3100").replace(/\/$/, ""),
   publicUrl: (process.env.SOLI_BACKEND_URL || "http://localhost:4000").replace(/\/$/, ""),
 

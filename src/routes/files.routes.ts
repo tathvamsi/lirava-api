@@ -16,7 +16,7 @@ filesRoutes.get("/:id", (c) => {
     ? `attachment; filename="${safeFilename}"`
     : `inline; filename="${safeFilename}"`;
 
-  return new Response(file.data, {
+  return new Response(file.data as any, {
     status: 200,
     headers: {
       "Content-Type": file.mime,

@@ -42,7 +42,7 @@ app.use("*", async (c, next) => {
   await next();
 
   const elapsed = Date.now() - start;
-  const status = c.res.status;
+  const status = (c.res as any)?.status ?? 200;
   const statusColor =
     status >= 500
       ? "\x1b[41m\x1b[37m"
@@ -69,11 +69,12 @@ app.use(
       if (!origin || origin.includes("localhost") || origin.includes("127.0.0.1")) {
         return origin || "*";
       }
-      return config.corsOrigins.includes(origin) ? origin : null;
+      const cleanOrigin = origin.replace(/\/$/, "");
+      return config.corsOrigins.includes(cleanOrigin) ? origin : null;
     },
     credentials: true,
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowHeaders: ["Content-Type", "Authorization", "x-soli-auth"],
+    allowHeaders: ["Content-Type", "Authorization", "x-soli-auth", "x-session-token"],
   })
 );
 
