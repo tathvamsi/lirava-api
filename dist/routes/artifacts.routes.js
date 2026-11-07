@@ -5,7 +5,7 @@ import { saveFile } from "../services/files/index.js";
 export const artifactsRoutes = new Hono();
 artifactsRoutes.get("/", (c) => {
     const userId = c.req.query("userId") || "";
-    const artifacts = listArtifacts(userId);
+    const artifacts = listArtifacts(userId, { agentOnly: c.req.query("agentOnly") === "true" });
     return c.json({ artifacts });
 });
 artifactsRoutes.post("/", async (c) => {

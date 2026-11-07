@@ -1,4 +1,4 @@
-import OpenAI from "openai";
+import { OpenAI } from "openai";
 import { config } from "../../config.js";
 
 let clientInstance: OpenAI | null = null;

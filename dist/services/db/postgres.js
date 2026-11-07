@@ -267,3 +267,9 @@ export async function deleteSession(sessionId) {
     catch { }
     return true;
 }
+export async function closeSql() {
+    if (sqlInstance) {
+        await sqlInstance.end();
+        sqlInstance = null;
+    }
+}

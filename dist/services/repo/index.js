@@ -241,11 +241,12 @@ export function listMessages(dotId, conversationId) {
     }));
 }
 // ---------------- ARTIFACTS ----------------
-export function listArtifacts(userId = "") {
+export function listArtifacts(userId = "", options) {
     const db = getDb();
+    const agentFilter = options?.agentOnly ? " AND conversation_id IS NOT NULL AND dot_id <> ''" : "";
     const query = userId
-        ? "SELECT * FROM artifacts WHERE user_id = ? OR user_id = '' ORDER BY created_at DESC"
-        : "SELECT * FROM artifacts ORDER BY created_at DESC";
+        ? `SELECT * FROM artifacts WHERE user_id = ?${agentFilter} ORDER BY created_at DESC`
+        : `SELECT * FROM artifacts WHERE 1 = 1${agentFilter} ORDER BY created_at DESC`;
     const rows = (userId ? db.prepare(query).all(userId) : db.prepare(query).all());
     return rows.map((r) => ({
         id: r.id,
