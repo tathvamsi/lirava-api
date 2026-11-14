@@ -1,11 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import app from "../src/index.js";
+import { createTestUser } from "./helpers.js";
 
-test("Legal Answer API via soli-backend", async () => {
+test("Legal answers need a signed-in user", async () => {
   const res = await app.request("/api/legal/answer", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: "What is Section 482 of BNSS?" }),
+  });
+  assert.strictEqual(res.status, 401);
+});
+
+test("Legal Answer API via soli-backend", async () => {
+  const user = await createTestUser("legal");
+  const res = await app.request("/api/legal/answer", {
+    method: "POST",
+    headers: user.headers,
     body: JSON.stringify({
       question: "What is Section 482 of BNSS?",
     }),

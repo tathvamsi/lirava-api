@@ -22,7 +22,7 @@ export class SoliBackendClient {
   }
 
   // ---------------- Agent ----------------
-  async sendMessage(params: { dotId: string; text: string; userId?: string }) {
+  async sendMessage(params: { vakilId: string; text: string; userId?: string }) {
     const res = await fetch(`${this.baseUrl}/api/agent/message`, {
       method: "POST",
       headers: this.headers,
@@ -32,11 +32,11 @@ export class SoliBackendClient {
     return res.json();
   }
 
-  async abortAgent(dotId: string) {
+  async abortVakil(vakilId: string) {
     const res = await fetch(`${this.baseUrl}/api/agent/abort`, {
       method: "POST",
       headers: this.headers,
-      body: JSON.stringify({ dotId }),
+      body: JSON.stringify({ vakilId }),
     });
     return res.json();
   }

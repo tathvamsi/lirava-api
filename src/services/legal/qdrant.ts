@@ -11,6 +11,7 @@ export function getQdrant(): QdrantClient {
     url: config.qdrantUrl,
     apiKey: config.qdrantApiKey,
     checkCompatibility: false,
+    timeout: config.upstreamTimeoutMs,
   });
 
   return qdrantClient;

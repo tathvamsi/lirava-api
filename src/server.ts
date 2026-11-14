@@ -1,6 +1,11 @@
 import { serve } from "@hono/node-server";
-import app from "./index.js";
-import { config } from "./config.js";
+import { assertProductionConfig, config } from "./config.js";
+
+// Refuse to start with missing or unsafe production settings.
+assertProductionConfig();
+
+const { default: app } = await import("./index.js");
+const { closeSql } = await import("./services/db/postgres.js");
 
 const server = serve(
   {
@@ -9,22 +14,24 @@ const server = serve(
     hostname: config.host,
   },
   (info) => {
-    console.log(`\n========================================================`);
-    console.log(`🚀 Soli Standalone Backend Service Running!`);
-    console.log(`📡 URL: http://localhost:${info.port}`);
-    console.log(`🧠 Local LLM Node: ${config.customLlmBaseUrl}`);
-    console.log(`⚖️ Legal Vector Engine: ${config.qdrantUrl}`);
-    console.log(`========================================================\n`);
-  }
+    console.log(`[soli-backend] listening on http://${config.host}:${info.port} (${config.nodeEnv})`);
+  },
 );
 
-const shutdown = () => {
-  console.log("\n[soli-backend] Gracefully shutting down...");
-  server.close(() => {
-    console.log("[soli-backend] Closed all active connections.");
+let shuttingDown = false;
+const shutdown = (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[soli-backend] ${signal} received, shutting down...`);
+  // Give in-flight requests a few seconds, then exit regardless (event streams stay open indefinitely).
+  const force = setTimeout(() => process.exit(0), 8000);
+  force.unref();
+  server.close(async () => {
+    await closeSql().catch(() => undefined);
     process.exit(0);
   });
 };
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("unhandledRejection", (reason) => console.error("[soli-backend] Unhandled rejection:", reason));

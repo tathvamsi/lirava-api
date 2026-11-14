@@ -1,6 +1,7 @@
 export type ServerEvent = {
   type: string;
-  dotId?: string;
+  vakilId?: string;
+  conversationId?: string;
   userId?: string;
   id?: string;
   delta?: string;

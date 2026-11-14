@@ -1,9 +1,7 @@
-import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { config } from "../../config.js";
-import { getDb } from "../db/index.js";
 import { extractText } from "unpdf";
+import { pgData } from "../data/pg.js";
 
 export interface Attachment {
   id: string;
@@ -13,17 +11,9 @@ export interface Attachment {
 }
 
 export interface FileRecord extends Attachment {
-  dotId: string;
+  vakilId: string;
   userId: string;
   createdAt: number;
-}
-
-const FILES_DIR = path.join(config.dotsDataDir, "files");
-
-function ensureDir() {
-  if (!fs.existsSync(FILES_DIR)) {
-    fs.mkdirSync(FILES_DIR, { recursive: true });
-  }
 }
 
 export function guessMime(name: string): string {
@@ -52,66 +42,54 @@ export function guessMime(name: string): string {
   return map[ext] || "application/octet-stream";
 }
 
-export function saveFile(
-  dotId: string,
+/** Stores a file for its owner in PostgreSQL and returns the handle used to refer to it. */
+export async function saveFile(
+  vakilId: string,
   name: string,
   mime: string,
   buffer: Buffer,
-  userId: string = ""
-): Attachment {
-  ensureDir();
-  const db = getDb();
+  userId: string,
+): Promise<Attachment> {
+  if (!userId) throw new Error("A file needs an owner.");
+  const sql = await pgData();
   const id = `file_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
   const cleanName = name.replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_").slice(0, 120) || "file";
   const resolvedMime = mime && mime !== "application/octet-stream" ? mime : guessMime(cleanName);
-  const now = Date.now();
 
-  const filePath = path.join(FILES_DIR, id);
-  fs.writeFileSync(filePath, buffer);
+  await sql`
+    INSERT INTO app_files (id, user_id, vakil_id, name, mime, size, data, created_at)
+    VALUES (${id}, ${userId}, ${vakilId}, ${cleanName}, ${resolvedMime}, ${buffer.length}, ${buffer}, ${Date.now()})`;
 
-  db.prepare(`
-    INSERT INTO files (id, dot_id, name, mime, size, source, box_path, user_id, created_at)
-    VALUES (?, ?, ?, ?, ?, 'user', NULL, ?, ?)
-  `).run(id, dotId, cleanName, resolvedMime, buffer.length, userId, now);
-
-  return {
-    id,
-    name: cleanName,
-    mime: resolvedMime,
-    size: buffer.length,
-  };
+  return { id, name: cleanName, mime: resolvedMime, size: buffer.length };
 }
 
-export function getFile(fileId: string): {
+export interface StoredFile {
   id: string;
   name: string;
   mime: string;
   size: number;
   data: Buffer;
-} | null {
-  ensureDir();
-  const db = getDb();
-  const row = db.prepare("SELECT * FROM files WHERE id = ?").get(fileId) as
-    | Record<string, any>
-    | undefined;
+}
 
+/** Returns a file only to the user who uploaded or generated it. */
+export async function getFileForUser(fileId: string, userId: string): Promise<StoredFile | null> {
+  if (!userId) return null;
+  const sql = await pgData();
+  const rows = await sql`SELECT id, name, mime, size, data FROM app_files WHERE id = ${fileId} AND user_id = ${userId} LIMIT 1`;
+  const row = rows[0];
   if (!row) return null;
-
-  const filePath = path.join(FILES_DIR, row.id);
-  if (!fs.existsSync(filePath)) return null;
-
-  const data = fs.readFileSync(filePath);
+  const data = Buffer.from(row.data as Uint8Array);
   return {
-    id: row.id,
-    name: row.name,
-    mime: row.mime || guessMime(row.name),
-    size: row.size || data.length,
+    id: row.id as string,
+    name: row.name as string,
+    mime: (row.mime as string) || guessMime(row.name as string),
+    size: Number(row.size) || data.length,
     data,
   };
 }
 
-export async function extractTextFromFile(fileId: string): Promise<string> {
-  const file = getFile(fileId);
+export async function extractTextFromFile(fileId: string, userId: string): Promise<string> {
+  const file = await getFileForUser(fileId, userId);
   if (!file) return "";
 
   const mime = file.mime.toLowerCase();
@@ -144,4 +122,12 @@ export async function extractTextFromFile(fileId: string): Promise<string> {
   }
 
   return "";
+}
+
+/** Removes a file the user owns. */
+export async function deleteFileForUser(fileId: string, userId: string): Promise<boolean> {
+  if (!userId) return false;
+  const sql = await pgData();
+  const rows = await sql`DELETE FROM app_files WHERE id = ${fileId} AND user_id = ${userId} RETURNING id`;
+  return rows.length > 0;
 }

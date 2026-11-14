@@ -1,117 +1,48 @@
-# Soli Backend Service (Standalone)
+# Lirava backend
 
-High-performance, decoupled backend service for the **Soli Legal AI Platform**.
+Hono + TypeScript service behind the Lirava web app. It owns authentication, chats, matters, documents, uploads, the agent runtime and legal search.
 
-This standalone service extracts the heavy AI agent execution runtime, statutory RAG vector search, legal court document generator, and operational administration APIs out of Next.js serverless functions into a dedicated, persistent Node.js/TypeScript process.
+## Storage
 
----
+Everything is stored in **PostgreSQL** (`DATABASE_URL`), each row tied to its owner and every query filtered by it. Nothing is kept on the server's disk or in the browser:
 
-## Architecture Overview
+- users, sessions and **all chats** (`chat_conversations`, `chat_messages`, with the sources each answer used; chats can be pinned or archived)
+- Vakils, matters, saved documents and **uploaded files** (`app_vakils`, `app_matters`, `app_artifacts`, `app_files`; file bytes are in the database, so a second instance sees the same files)
+- the page-by-page **search index of matter documents** (`matter_documents`, `document_chunks`) and the **statute library** (`legal_provisions`, plus the uploaded Acts in `app_admin_documents`)
+- administrator settings (models, nodes, API keys, audit log), connector and plugin settings, and per-user preferences (`user_preferences`: when each Vakil was last read, the document preview width)
 
-```
-                           ┌────────────────────────┐
-                           │   soli-web (Next.js)   │
-                           │     Port: 3100         │
-                           └───────────┬────────────┘
-                                       │
-                                       │ REST / SSE
-                                       ▼
-┌────────────────────────┐ ───► ┌────────────────────────┐ ◄─── ┌────────────────────────┐
-│  soli-admin (Next.js)  │      │  soli-backend (Hono)   │      │ soli-desktop (Electron)│
-│     Port: 3200         │      │     Port: 4000         │      │                        │
-└────────────────────────┘      └───────────┬────────────┘      └────────────────────────┘
-                                            │
-               ┌────────────────────────────┼────────────────────────────┐
-               │                            │                            │
-               ▼                            ▼                            ▼
-      ┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
-      │  Local LLM Node │          │ Qdrant Vector DB│          │  dots.db Vault  │
-      │   (llama.cpp)   │          │ (Statutory RAG) │          │  (SQLite Sync)  │
-      └─────────────────┘          └─────────────────┘          └─────────────────┘
-```
+Tables are created on startup, with a PostgreSQL advisory lock so several instances starting together set up one at a time. Data stored under the older names ("dot", "agent") is renamed to "Vakil" automatically.
 
----
+If an older installation kept data in a local file (`dots.db` in `LEGACY_DATA_DIR`), that file is read **once** and its rows with a known owner are copied into PostgreSQL. It is never written to again, and a new installation never creates it.
 
-## Key Benefits of Decoupling
+A "Vakil" is the AI advocate a user chats with (Soli Master, Nyaya, Vakil, Pramaan, Docket, or one they create).
 
-1. **No Next.js Route Timeout Constraints**: Heavy ReAct loops, multi-step legal drafting, and OCR processing run continuously without hitting 15s/30s serverless gateway timeouts.
-2. **Persistent Event-Driven Architecture**: Native Server-Sent Events (SSE) and in-memory event bus stream agent thinking steps, approvals, and status transitions reliably.
-3. **Independent Scaling**: Scale the backend compute horizontally on GPU/high-memory instances while serving frontend assets via lightweight edge CDNs.
-4. **Resilient Hot Reloads**: Frontend UI edits in `soli-web` and `soli-admin` hot-reload instantly without terminating long-running agent threads or database locks.
+## How answers are made
 
----
+1. **Your documents:** files attached to a chat are read page by page and indexed. A question searches the documents of that chat and of its matter, and the matching passages (with their page) go to the model as labelled excerpts. The answer shows them under "Sources consulted", linking to the page.
+2. **Statutes:** provisions come from the statute library by full-text search and, when the embedding server is up, by semantic search too. Administrators load an Act (PDF, Word or text) in the admin console; it is split into sections and searchable at once. **You supply the official text**: the built-in set is a small starter.
+3. **Background replies:** a message is saved and returned at once; the answer streams in through the live event stream. At most `MAX_RUNS_PER_USER` (2) answers per user and `MAX_CONCURRENT_RUNS` (4) overall are generated at a time; the rest show as "waiting". Stop keeps the part already written.
+4. With no sources found, or the model down, the answer says so plainly instead of citing anything.
 
-## API Endpoints
+## Run locally
 
-### 1. Health & System
-- `GET /` - Service status & endpoint discovery
-- `GET /api/ping` - Health check & local llama.cpp node heartbeat
-
-### 2. Autonomous Agent
-- `POST /api/agent/message` - Send message to litigation persona / dot
-- `POST /api/agent/abort` - Terminate active running agent step
-- `GET /api/agent/state/:dotId` - Inspect agent run state and step counter
-
-### 3. Real-Time Streaming
-- `GET /api/events` - SSE event stream delivering real-time agent output & status
-
-### 4. Legal Document & RAG Engine
-- `GET /api/legal/search?q=query&act=BNS` - Statutory similarity search via Qdrant
-- `POST /api/legal/generate-pdf` - Generate court-margin PDF pleading
-- `POST /api/legal/generate-docx` - Generate editable Microsoft Word pleading
-
-### 5. Unified Administration
-- `GET/POST /api/admin/models` - Model Registry & llama.cpp orchestration
-- `GET/POST /api/admin/nodes` - Inference Nodes & VRAM tracking
-- `GET/POST/DELETE /api/admin/documents` - Multi-tenant confidential vault & OCR pipeline
-- `GET/POST/DELETE /api/admin/api-keys` - High-entropy SHA-256 API key management
-- `GET /api/admin/analytics` - Operational usage telemetry & token analytics
-- `GET /api/admin/audit-logs` - Security audit ledger with auto-redaction
-
----
-
-## Getting Started
-
-### 1. Installation
 ```bash
-cd soli-backend
 pnpm install
+cp .env.example .env      # development only needs DATABASE_URL (and the model/Qdrant addresses to get real answers)
+pnpm dev                  # http://localhost:4000
+pnpm test                 # needs a reachable PostgreSQL in DATABASE_URL
 ```
 
-### 2. Development Mode
-```bash
-pnpm dev
-# Running at http://localhost:4000
-```
+## Production
 
-### 3. Run Test Suite
-```bash
-pnpm test
-```
+`NODE_ENV=production` makes the server **refuse to start** unless `SESSION_SECRET` (32+ characters, same as the web app), `DATABASE_URL`, `CORS_ORIGINS`, `CUSTOM_LLM_BASE_URL`, `ADMIN_EMAILS` and a signup gate (`SIGNUP_INVITE_CODES` / `SIGNUP_ALLOWED_DOMAINS`, or `ALLOW_OPEN_SIGNUP=true`) are set. See `.env.example`.
 
-### 4. Production Build
-```bash
-pnpm build
-pnpm start
-```
+- `GET /health` is liveness; `GET /ready` checks PostgreSQL. The Docker health check uses `/ready`.
+- Set `TRUST_PROXY=true` only when the backend is reached through the web app or a trusted proxy.
+- `docker build -t lirava-api .` then run with the env file and a volume on `/data`.
 
----
+## Known limits
 
-## Consuming with `SoliBackendClient`
-
-```typescript
-import { SoliBackendClient } from "soli-backend/client";
-
-const client = new SoliBackendClient({
-  baseUrl: "http://localhost:4000",
-});
-
-// Send message to legal agent
-const response = await client.sendMessage({
-  dotId: "dot-criminal-lawyer",
-  text: "Draft grounds for a bail petition under BNSS Section 482.",
-});
-
-// Search statutory database
-const statutes = await client.searchStatutes("bailable offenses under BNS");
-```
+- With the model server unreachable, the service answers with a clearly labelled reference summary from the built-in statute library instead of an AI answer.
+- The statute library is a small hand-written seed set. Case law, and indexing of uploaded matter documents, are not built: admin uploads are stored but marked `uploaded` (not indexed).
+- PDF export covers Latin text. Documents with Hindi or other scripts export to Word (.docx) in full.

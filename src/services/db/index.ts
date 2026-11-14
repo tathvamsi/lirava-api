@@ -8,16 +8,31 @@ let dbInstance: DatabaseSync | null = null;
 export function getDb(): DatabaseSync {
   if (dbInstance) return dbInstance;
 
-  const dbDir = config.dotsDataDir;
+  const dbDir = config.legacyDataDir;
   if (!fs.existsSync(dbDir)) {
     fs.mkdirSync(dbDir, { recursive: true });
   }
 
   const dbPath = path.join(dbDir, "dots.db");
   dbInstance = new DatabaseSync(dbPath);
+  // Wait for a competing writer instead of failing at once with "database is locked", and use the
+  // write-ahead log so readers do not block writers.
+  dbInstance.exec("PRAGMA busy_timeout = 10000");
+  dbInstance.exec("PRAGMA journal_mode = WAL");
+  dbInstance.exec("PRAGMA synchronous = NORMAL");
 
   initSchema(dbInstance);
   return dbInstance;
+}
+
+/**
+ * The old local file, only if this machine has one. Used solely to copy its contents into PostgreSQL once;
+ * nothing new is ever written to it, and a fresh installation never creates it.
+ */
+export function getLegacyDb(): DatabaseSync | null {
+  if (dbInstance) return dbInstance;
+  if (!fs.existsSync(path.join(config.legacyDataDir, "dots.db"))) return null;
+  return getDb();
 }
 
 function initSchema(db: DatabaseSync) {
@@ -45,6 +60,7 @@ function initSchema(db: DatabaseSync) {
       title TEXT,
       card TEXT,
       source TEXT,
+      attachments TEXT,
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_messages_dot ON messages(dot_id, created_at);
@@ -94,7 +110,10 @@ function initSchema(db: DatabaseSync) {
       dot_id TEXT,
       name TEXT NOT NULL,
       size INTEGER NOT NULL,
-      type TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT '',
+      mime TEXT,
+      source TEXT,
+      box_path TEXT,
       data BLOB,
       user_id TEXT NOT NULL DEFAULT '',
       created_at INTEGER NOT NULL
@@ -405,53 +424,15 @@ function migrate(db: DatabaseSync) {
     db.exec(`ALTER TABLE artifacts ADD COLUMN docx_file_id TEXT`);
   }
 
-  seedChamberDots(db);
-}
-
-function seedChamberDots(db: DatabaseSync) {
-  const dots = [
-    {
-      id: "soli_master",
-      name: "Soli Master",
-      purpose: "Autonomous Legal Orchestrator & Chamber Director. Automatically evaluates tasks and coordinates specialist counsel.",
-      look: JSON.stringify({ color: "#D4AF37", shape: "circle" }),
-    },
-    {
-      id: "nyaya",
-      name: "Nyaya",
-      purpose: "Senior Legal Researcher & Constitutional Jurist. Precedent ratio extraction, statutory interpretation & comparative law.",
-      look: JSON.stringify({ color: "#2563EB", shape: "circle" }),
-    },
-    {
-      id: "vakil",
-      name: "Vakil",
-      purpose: "Courtroom Drafting Counsel & Advocate. Court pleadings, bail applications, statutory notices & petitions.",
-      look: JSON.stringify({ color: "#059669", shape: "circle" }),
-    },
-    {
-      id: "pramaan",
-      name: "Pramaan",
-      purpose: "Forensic Case Scrutiny & Evidence Auditor. Contradiction matrices, Section 63 BSA compliance & timelines.",
-      look: JSON.stringify({ color: "#D97706", shape: "circle" }),
-    },
-    {
-      id: "docket",
-      name: "Docket",
-      purpose: "Chamber Practice Manager & Limitation Coordinator. Limitation calculations, cause list tracking & hearing preparation.",
-      look: JSON.stringify({ color: "#7C3AED", shape: "circle" }),
-    },
-  ];
-
-  const insertStmt = db.prepare(`
-    INSERT OR REPLACE INTO dots (id, name, purpose, look, status, user_id, created_at)
-    VALUES (?, ?, ?, ?, 'idle', '', ?)
-  `);
-
-  const now = Date.now();
-  for (const d of dots) {
-    const existing = db.prepare("SELECT id FROM dots WHERE id = ?").get(d.id);
-    if (!existing) {
-      insertStmt.run(d.id, d.name, d.purpose, d.look, now);
+  // Columns the runtime writes that older databases never received.
+  const addMissing = (table: string, defs: Record<string, string>) => {
+    const existing = columns(table);
+    for (const [name, def] of Object.entries(defs)) {
+      if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`);
     }
-  }
+  };
+  addMissing("messages", { attachments: "TEXT" });
+  addMissing("files", { mime: "TEXT", source: "TEXT", box_path: "TEXT" });
+  addMissing("dots", { model: "TEXT" });
+
 }

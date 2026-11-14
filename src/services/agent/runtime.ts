@@ -1,102 +1,173 @@
 import { getLlmClient } from "./client.js";
-import { getDb } from "../db/index.js";
+import { getMatterForUser } from "../repo/index.js";
 import { emit } from "../bus/index.js";
-import { createConversation, getConversation } from "../repo/index.js";
+import { buildDocumentContext, statuteCitations } from "../documents/context.js";
+import { indexedStatus, linkDocuments, searchDocuments, type DocumentHit } from "../documents/index.js";
+import {
+  ChatError,
+  type Citation,
+  createConversation,
+  getConversation,
+  getChatSummary,
+  historyAfter,
+  insertMessage,
+  latestConversationId,
+  touchConversation,
+} from "../chats/store.js";
+import {
+  CONTINUE_PROMPT,
+  CUT_OFF_NOTICE,
+  endAtSentence,
+  estimateTokens,
+  fitPrompt,
+  safetyTokens,
+  windowFromError,
+  type ChatTurn,
+  type PromptSection,
+} from "./context-budget.js";
+import { maybeSummarizeChat, toTurn } from "./summary.js";
 import { config } from "../../config.js";
 import { generateLegalResponse } from "../legal/knowledge.js";
+import { OFFLINE_NOTICE } from "../legal/notice.js";
 import { retrieveLegalContext, type RetrievedLegalContext } from "../legal/rag.js";
 import { getAgentPersonaPrompt } from "./personas.js";
 import { routeLegalTask, type RoutingDecision } from "./router.js";
 import { extractTextFromFile, type Attachment } from "../files/index.js";
 import crypto from "node:crypto";
+import { RunQueue } from "./queue.js";
 
 export interface MessageRecord {
   id: string;
-  dotId: string;
-  dot_id?: string;
+  vakilId: string;
+  vakil_id?: string;
   conversationId?: string | null;
   conversation_id?: string | null;
-  role: "user" | "dot" | "assistant" | "system";
+  role: "user" | "vakil" | "assistant" | "system";
   text: string;
   title?: string | null;
   card?: string | null;
   source?: string | null;
   attachments?: Attachment[] | null;
+  citations?: Citation[] | null;
   createdAt: number;
   created_at?: number;
 }
 
 export interface RunState {
+  /** idle, waiting for a free slot, or generating. */
+  phase: "idle" | "queued" | "running";
+  vakilId: string;
+  conversationId: string;
   running: boolean;
   abortController: AbortController | null;
   currentStep: number;
 }
 
+// Run state is kept per user and per conversation. Sending in one chat never cancels an answer that is
+// still being written in another, and one user's message or Stop never touches another user's run.
 const activeRuns = new Map<string, RunState>();
+const runKey = (conversationId: string, userId: string) => `${userId}::${conversationId}`;
 
-export function getRunState(dotId: string): RunState {
-  let state = activeRuns.get(dotId);
+export function getRunState(conversationId: string, userId: string, vakilId = ""): RunState {
+  const key = runKey(conversationId, userId);
+  let state = activeRuns.get(key);
   if (!state) {
-    state = { running: false, abortController: null, currentStep: 0 };
-    activeRuns.set(dotId, state);
+    state = { phase: "idle", vakilId, conversationId, running: false, abortController: null, currentStep: 0 };
+    activeRuns.set(key, state);
   }
   return state;
 }
 
-export function abortRun(dotId: string): boolean {
-  const state = activeRuns.get(dotId);
-  if (state?.running && state.abortController) {
+/**
+ * Stops this user's running answer(s): one chat when `conversationId` is given, otherwise every
+ * running answer of that agent. Returns whether anything was stopped.
+ */
+/** Answers this user has in progress or waiting, by chat. Sent with the live stream so a reload shows them. */
+export function runningFor(userId: string): Record<string, "queued" | "running"> {
+  const out: Record<string, "queued" | "running"> = {};
+  for (const [key, state] of activeRuns) {
+    if (key.startsWith(`${userId}::`) && state.running && state.phase !== "idle") out[state.conversationId] = state.phase;
+  }
+  return out;
+}
+
+// At most this many answers are generated at once overall, and per user; the rest wait their turn.
+const runQueue = new RunQueue(Number(process.env.MAX_CONCURRENT_RUNS || 4), Number(process.env.MAX_RUNS_PER_USER || 2));
+
+/** How many times a cut-off answer is continued, and the least room worth continuing in. */
+const MAX_CONTINUATIONS = Number(process.env.MAX_CONTINUATIONS || 2);
+const MIN_CONTINUE_TOKENS = 150;
+
+// If the model server reports a smaller window than configured, that is used from then on.
+let learnedWindow: number | null = null;
+const currentWindow = () => Math.min(config.contextWindowTokens, learnedWindow ?? Number.POSITIVE_INFINITY);
+
+export function abortRun(vakilId: string, userId: string, conversationId?: string): boolean {
+  let stopped = false;
+  for (const [key, state] of activeRuns) {
+    if (!key.startsWith(`${userId}::`) || !state.running || !state.abortController) continue;
+    if (conversationId ? state.conversationId !== conversationId : state.vakilId !== vakilId) continue;
     state.abortController.abort();
     state.running = false;
-    emit({ type: "dot_status", dotId, data: { status: "idle" } });
-    return true;
+    stopped = true;
   }
-  return false;
+  if (stopped) emit({ type: "vakil_status", vakilId, userId, data: { status: "idle" } });
+  return stopped;
 }
 
 export async function sendMessage(
-  dotId: string,
+  vakilId: string,
   userText: string,
-  userId: string = "usr-super-admin",
+  userId: string,
   conversationId?: string,
   clientMsgId?: string,
-  attachments?: Attachment[]
+  attachments?: Attachment[],
+  options: { background?: boolean } = {},
 ): Promise<{ userMessage: MessageRecord; assistantMessage?: MessageRecord }> {
-  const db = getDb();
-  const runState = getRunState(dotId);
+  if (!userId) throw new ChatError(401, "Sign in required.");
+  // Resolve the conversation. It must belong to this user: someone else's id is
+  // reported as "not found", exactly like an id that does not exist.
+  let conversation = conversationId ? await getConversation(conversationId, userId) : null;
+  if (conversationId && !conversation) throw new ChatError(404, "Conversation not found.");
+  if (!conversation) {
+    const latest = await latestConversationId(vakilId, userId);
+    conversation = latest
+      ? await getConversation(latest, userId)
+      : await createConversation(vakilId, userText.slice(0, 40) || "New consultation", userId);
+  }
+  if (!conversation) throw new ChatError(404, "Conversation not found.");
+  conversationId = conversation.id;
 
-  // If already running, abort current run to accept newest prompt
+  // A new message in a chat replaces an answer still being written in that same chat (and only that chat).
+  const runState = getRunState(conversationId, userId, vakilId);
   if (runState.running && runState.abortController) {
     runState.abortController.abort();
   }
 
-  // Ensure conversation exists so messages are never orphaned without a conversationId
-  if (!conversationId) {
-    const existing = db.prepare(`SELECT id FROM conversations WHERE dot_id = ? ORDER BY updated_at DESC LIMIT 1`).get(dotId) as { id: string } | undefined;
-    if (existing?.id) {
-      conversationId = existing.id;
-    } else {
-      const conv = createConversation(dotId, userText.slice(0, 40) || "New consultation", userId);
-      conversationId = conv.id;
-    }
-  }
+  const matterId = conversation.matterId;
+  // The matter's details go into the prompt, but only if it is one of this user's own matters.
+  const matter = matterId ? await getMatterForUser(matterId, userId) : null;
 
-  const matterId = conversationId ? getConversation(conversationId)?.matterId : null;
-  const matter = matterId
-    ? db.prepare("SELECT title, client, court, notes FROM matters WHERE id = ? AND user_id = ?").get(matterId, userId) as { title: string; client: string; court: string; notes: string } | undefined
-    : undefined;
-
-  console.log(`\x1b[34m[AgentRuntime]\x1b[0m 💬 Prompt received for dot=${dotId} conv=${conversationId || "none"}: "${userText.slice(0, 75)}${userText.length > 75 ? "..." : ""}" (attachments: ${attachments?.length || 0})`);
+  console.log(`\x1b[34m[AgentRuntime]\x1b[0m 💬 Prompt received for vakil=${vakilId} conv=${conversationId || "none"}: "${userText.slice(0, 75)}${userText.length > 75 ? "..." : ""}" (attachments: ${attachments?.length || 0})`);
 
   // 1. Insert User Message
-  const userMsgId = clientMsgId || `msg-${crypto.randomUUID()}`;
   const now = Date.now();
+  const stored = await insertMessage({
+    id: clientMsgId,
+    conversationId,
+    userId,
+    vakilId,
+    role: "user",
+    text: userText,
+    attachments: attachments && attachments.length > 0 ? attachments : null,
+    createdAt: now,
+  });
   const userMsg: MessageRecord = {
-    id: userMsgId,
-    dotId: dotId,
-    dot_id: dotId,
-    conversationId: conversationId || null,
-    conversation_id: conversationId || null,
+    id: stored.id,
+    vakilId: vakilId,
+    vakil_id: vakilId,
+    conversationId,
+    conversation_id: conversationId,
     role: "user",
     text: userText,
     attachments: attachments && attachments.length > 0 ? attachments : null,
@@ -104,121 +175,114 @@ export async function sendMessage(
     created_at: now,
   };
 
-  const attachmentsJson = userMsg.attachments ? JSON.stringify(userMsg.attachments) : null;
-  db.prepare(`
-    INSERT INTO messages (id, dot_id, conversation_id, role, text, attachments, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(userMsg.id, userMsg.dotId, userMsg.conversationId ?? null, userMsg.role, userMsg.text, attachmentsJson, userMsg.createdAt);
-
   // Keep the conversation's recency stamp fresh so the sidebar can order by it.
-  if (conversationId) {
-    db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`).run(now, conversationId);
-  }
+  await touchConversation(conversationId, userId, now);
 
-  emit({ type: "message", dotId, userId, data: userMsg });
-  emit({ type: "dot_status", dotId, userId, data: { status: "thinking" } });
+  emit({ type: "message", vakilId, userId, data: userMsg });
+  emit({ type: "vakil_status", vakilId, userId, data: { status: "thinking" } });
   if (/^(hi|hello|hey|greetings|good\s+(morning|afternoon|evening))[.!?\s]*$/i.test(userText.trim())) {
     const greetingText = "Hello. I'm Lirava. How can I help with your legal matter today?";
     const assistantId = `msg-${crypto.randomUUID()}`;
     const assistantTime = Date.now();
     const assistantMessage: MessageRecord = {
       id: assistantId,
-      dotId,
-      dot_id: dotId,
+      vakilId,
+      vakil_id: vakilId,
       conversationId: conversationId || null,
       conversation_id: conversationId || null,
-      role: "dot",
+      role: "vakil",
       text: greetingText,
       createdAt: assistantTime,
       created_at: assistantTime,
     };
 
-    db.prepare(`
-      INSERT INTO messages (id, dot_id, conversation_id, role, text, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(assistantMessage.id, assistantMessage.dotId, assistantMessage.conversationId ?? null, assistantMessage.role, assistantMessage.text, assistantMessage.createdAt);
+    await insertMessage({
+      id: assistantMessage.id,
+      conversationId,
+      userId,
+      vakilId,
+      role: "vakil",
+      text: assistantMessage.text,
+      createdAt: assistantMessage.createdAt,
+    });
 
-    emit({ type: "message", dotId, userId, data: assistantMessage });
-    emit({ type: "dot_status", dotId, userId, data: { status: "idle" } });
+    emit({ type: "message", vakilId, userId, data: assistantMessage });
+    emit({ type: "vakil_status", vakilId, userId, data: { status: "idle" } });
     return { userMessage: userMsg, assistantMessage };
   }
 
-  // 2. Fetch recent conversation history
-  // Local LLM has n_ctx = 1792. We keep up to 4 recent turns and cap long previous outputs
-  // so that the prompt stays well under 800 tokens, leaving >1000 tokens for generation.
-  const historyLimit = 6;
-  const historyQuery = conversationId
-    ? `SELECT role, text FROM messages WHERE conversation_id = ? AND id != ? ORDER BY created_at DESC LIMIT ?`
-    : `SELECT role, text FROM messages WHERE dot_id = ? AND id != ? ORDER BY created_at DESC LIMIT ?`;
-  const historyParams = conversationId ? [conversationId, userMsg.id, historyLimit] : [dotId, userMsg.id, historyLimit];
-  const historyRows = db.prepare(historyQuery).all(...historyParams) as Array<{ role: string; text: string }>;
+  // From here the answer is produced. It can run inside this call, or in the background.
+  const abortController = new AbortController();
+  runState.running = true;
+  runState.abortController = abortController;
+  runState.currentStep = 1;
 
-  // Sanitize history to prevent pattern poisoning:
-  // - Exclude repeated identical queries
-  // - Exclude prior raw clause dumps or fallback messages
-  // - Truncate older context so it fits safely within the local LLM window
-  const cleanHistory = historyRows
-    .reverse()
-    .filter((m) => {
-      if (m.role === "user" && m.text.trim().toLowerCase() === userText.trim().toLowerCase()) return false;
-      if (m.role === "dot" && (m.text.includes('(a) "information"') || m.text.includes("Legal Consultation Brief"))) return false;
-      return true;
-    })
-    .map((m) => {
-      const textWithoutNotice = m.text.replace(/^> ⚖️[\s\S]*?---\n\n/, "").trim();
-      return {
-        role: (m.role === "dot" ? "assistant" : m.role === "user" ? "user" : "system") as "user" | "assistant" | "system",
-        content: textWithoutNotice.length > 400 ? textWithoutNotice.slice(0, 400) + "..." : textWithoutNotice,
-      };
-    });
+  const generate = async (): Promise<{ userMessage: MessageRecord; assistantMessage?: MessageRecord }> => {
+  // 2. Chat history. Older messages live on as a running summary saved with the chat; the messages after it are
+  // loaded here (this user's own conversation only) and the newest ones that fit the model's window are used.
+  const { summary: chatSummary, upto: summaryUpto } = await getChatSummary(conversationId, userId).catch(() => ({ summary: "", upto: 0 }));
+  const historyRows = await historyAfter(conversationId, userId, userMsg.id, summaryUpto, 40);
 
-  console.log(`\x1b[34m[AgentRuntime]\x1b[0m 📜 Context loaded: ${cleanHistory.length} sanitized historical messages for persona dotId=${dotId}`);
+  // Sanitize history to prevent pattern poisoning: leave out repeated identical questions, stored fallback
+  // messages and raw clause dumps (see toTurn). Long messages are shortened per message, not dropped.
+  const cleanHistory: ChatTurn[] = historyRows
+    .filter((m) => !(m.role === "user" && m.text.trim().toLowerCase() === userText.trim().toLowerCase()))
+    .map(toTurn)
+    .filter((t): t is ChatTurn => t !== null);
 
-  // 3. Extract text content from any user-attached documents
+  console.log(`\x1b[34m[AgentRuntime]\x1b[0m 📜 Context loaded: ${cleanHistory.length} historical messages${chatSummary ? " + chat summary" : ""} for persona vakilId=${vakilId}`);
+
+  // 3. Tie the attached documents to this chat and matter so they stay searchable in later questions.
+  const attachedIds = (attachments ?? []).map((att) => att.id);
+  await linkDocuments(userId, attachedIds, conversationId, conversation.matterId ?? null).catch((err) =>
+    console.warn("[AgentRuntime] could not link documents:", err.message),
+  );
+  const indexed = await indexedStatus(userId, attachedIds).catch(() => new Map<string, string>());
+
+  // Files whose text is not indexed (unsupported or unreadable) are still read directly, as before.
   let attachedDocumentContext = "";
   if (attachments && attachments.length > 0) {
     for (const att of attachments) {
-      const extracted = await extractTextFromFile(att.id);
+      if (indexed.get(att.id) === "ready") continue;
+      const extracted = await extractTextFromFile(att.id, userId);
       if (extracted.trim()) {
         attachedDocumentContext += `\n\n[USER ATTACHED DOCUMENT: ${att.name}]\n${extracted.trim()}\n[END OF ATTACHED DOCUMENT]`;
       }
     }
   }
 
-  const abortController = new AbortController();
-  runState.running = true;
-  runState.abortController = abortController;
-  runState.currentStep = 1;
-
   try {
     const openai = getLlmClient();
 
     // 0. Master Orchestrator task analysis & sub-agent routing
     const isMasterOrGeneral =
-      dotId === "soli_master" ||
-      dotId.includes("master") ||
-      dotId.includes("soli") ||
-      (!dotId.includes("vakil") && !dotId.includes("nyaya") && !dotId.includes("pramaan") && !dotId.includes("docket"));
+      vakilId === "soli_master" ||
+      vakilId.includes("master") ||
+      vakilId.includes("soli") ||
+      (!vakilId.includes("vakil") && !vakilId.includes("nyaya") && !vakilId.includes("pramaan") && !vakilId.includes("docket"));
 
     let routing: RoutingDecision | null = null;
-    let targetSubAgent = dotId;
+    let targetSubAgent = vakilId;
 
     if (isMasterOrGeneral) {
       routing = routeLegalTask(userText, attachments?.length || 0);
       targetSubAgent = routing.target;
       console.log(`\x1b[35m[MasterAgent]\x1b[0m ⚖️ Analyzed task -> Delegating to ${routing.name} (${routing.role}). Reason: ${routing.reason}`);
-      emit({ type: "agent_routing", dotId, userId, data: routing });
+      emit({ type: "agent_routing", vakilId, userId, data: routing });
     }
 
     // 1. Retrieve RAG context from vector legal corpus (Qdrant) and ingested vault
-    const ragResult = await retrieveLegalContext(userText);
+    const ragResult = await Promise.race([
+      retrieveLegalContext(userText).catch(() => null),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), config.upstreamTimeoutMs * 2)),
+    ]);
     if (ragResult) {
       console.log(
         `\x1b[32m[AgentRuntime]\x1b[0m 📚 Legal Vector RAG retrieved context (${ragResult.sources.length} sources, ${ragResult.contextText.length} chars)`
       );
       emit({
         type: "rag_context",
-        dotId,
+        vakilId,
         userId,
         data: {
           sources: ragResult.sources,
@@ -227,47 +291,84 @@ export async function sendMessage(
       });
     }
 
-    // Prepare system prompt tailored to the active sub-agent persona (Vakil, Nyaya, Pramaan, Docket)
-    const personaPrompt = getAgentPersonaPrompt(dotId, targetSubAgent);
-    let enhancedSystemPrompt = personaPrompt;
+    // 2. Passages of this user's documents (attached to this chat, or in its matter) that match the question
+    const documentHits: DocumentHit[] = await Promise.race([
+      searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null }, userText, 5).catch(() => [] as DocumentHit[]),
+      new Promise<DocumentHit[]>((resolve) => setTimeout(() => resolve([]), config.upstreamTimeoutMs)),
+    ]);
+    const documentContext = buildDocumentContext(documentHits);
+    let citations: Citation[] = [...documentContext.citations, ...statuteCitations(ragResult?.sources)];
+
+    // The prompt is built from sections so that, when it is too long for the model's window, the least important
+    // ones are shortened first (see context-budget.ts). Instructions and the user's question are never cut.
+    const sections: PromptSection[] = [{ id: "persona", text: getAgentPersonaPrompt(vakilId, targetSubAgent), shedOrder: 100 }];
 
     if (ragResult) {
-      enhancedSystemPrompt += `\n\n${ragResult.contextText}\n\nLEGAL COUNSEL DIRECTIVES FOR RETRIEVED STATUTES & PRECEDENTS:\n- Formulate your legal advice and drafting strictly grounded upon the statutory sections and judicial precedents provided above.\n- State exact sections (BNSS, BNS, BSA, CPC, NI Act), statutory ingredients, and relevant ratios.\n- Do NOT output synthetic platform banners or watermarks. Provide authentic courtroom counsel.`;
+      sections.push({
+        id: "statutes",
+        text: ragResult.contextText,
+        tail: `LEGAL COUNSEL DIRECTIVES FOR RETRIEVED STATUTES & PRECEDENTS:\n- Formulate your legal advice and drafting strictly grounded upon the statutory sections and judicial precedents provided above.\n- State exact sections (BNSS, BNS, BSA, CPC, NI Act), statutory ingredients, and relevant ratios.\n- Do NOT output synthetic platform banners or watermarks. Provide authentic courtroom counsel.`,
+        floorTokens: 350,
+        shedOrder: 50,
+      });
+    } else {
+      sections.push({
+        id: "no-sources",
+        text: `NO STATUTORY SOURCES WERE RETRIEVED FOR THIS QUESTION. Do not present case names, citations, bench strengths or section numbers from memory as verified. If you mention any authority, say that it is unverified and must be checked against the official source. Say plainly when you are unsure.`,
+        shedOrder: 100,
+      });
+    }
+
+    if (documentContext.text) {
+      sections.push({ id: "documents", text: documentContext.body ?? documentContext.text, tail: documentContext.rules, floorTokens: 300, shedOrder: 40 });
     }
 
     if (attachedDocumentContext) {
-      enhancedSystemPrompt += `\n\nUSER UPLOADED ATTACHMENT CONTEXT:\nThe user has provided documents along with their query. Refer to the attached text below to analyze clauses, provide legal reviews, or answer questions directly based on the user's uploaded material:\n${attachedDocumentContext.slice(0, 6000)}`;
+      sections.push({
+        id: "attachments",
+        text: `USER UPLOADED ATTACHMENT CONTEXT:\nThe user has provided documents along with their query. Refer to the attached text below to analyze clauses, provide legal reviews, or answer questions directly based on the user's uploaded material:\n${attachedDocumentContext.slice(0, 6000)}`,
+        floorTokens: 250,
+        shedOrder: 20,
+      });
     }
 
     if (matter) {
-      enhancedSystemPrompt += `\n\nCURRENT MATTER CONTEXT:\nMatter: ${matter.title}\nClient: ${matter.client || "Not recorded"}\nCourt / forum: ${matter.court || "Not recorded"}\nMatter notes: ${matter.notes || "None recorded"}\nKeep this matter context in mind, but do not invent facts not supplied by the user or sources.`;
+      sections.push({
+        id: "matter",
+        text: `CURRENT MATTER CONTEXT:\nMatter: ${matter.title}\nClient: ${matter.client || "Not recorded"}\nCourt / forum: ${matter.court || "Not recorded"}\nMatter notes: ${(matter.notes || "None recorded").slice(0, 1500)}`,
+        tail: `Keep this matter context in mind, but do not invent facts not supplied by the user or sources.`,
+        floorTokens: 120,
+        shedOrder: 30,
+      });
     }
 
-    // When RAG or attachments are injected, keep only recent turns to fit within context ceiling
-    const activeHistory = ragResult || attachedDocumentContext ? cleanHistory.slice(-2) : cleanHistory;
+    if (chatSummary) {
+      sections.push({
+        id: "summary",
+        text: `SUMMARY OF THE EARLIER PART OF THIS CHAT (those messages are no longer shown; treat this as background and do not repeat it):\n${chatSummary}`,
+        floorTokens: 150,
+        shedOrder: 35,
+      });
+    }
 
-    const messages = [
-      {
-        role: "system" as const,
-        content: enhancedSystemPrompt,
-      },
-      ...activeHistory,
-      {
-        role: "user" as const,
-        content: userText
-      }
-    ];
+    const fitted = fitPrompt({ sections, history: cleanHistory, userText, windowTokens: currentWindow(), answerTokens: config.answerMaxTokens });
+    const messages = fitted.messages;
+    console.log(
+      `\x1b[34m[AgentRuntime]\x1b[0m 📏 Prompt ~${fitted.promptTokens} tokens of ${currentWindow()} (answer up to ${fitted.maxAnswerTokens}); ` +
+        `${cleanHistory.length - fitted.droppedHistory}/${cleanHistory.length} chat messages kept${fitted.shortened.length ? `; shortened: ${fitted.shortened.join(", ")}` : ""}${fitted.userTextShortened ? "; user message shortened" : ""}`,
+    );
 
     const asstMsgId = `msg-${crypto.randomUUID()}`;
     const asstTime = Date.now();
     const asstMsg: MessageRecord = {
       id: asstMsgId,
-      dotId: dotId,
-      dot_id: dotId,
+      vakilId: vakilId,
+      vakil_id: vakilId,
       conversationId: conversationId || null,
       conversation_id: conversationId || null,
-      role: "dot",
+      role: "vakil",
       text: "",
+      citations: citations.length ? citations : null,
       createdAt: asstTime,
       created_at: asstTime,
     };
@@ -279,21 +380,14 @@ export async function sendMessage(
     const llmStartTime = Date.now();
     let initialMessageEmitted = false;
 
-    try {
-      console.log(`\x1b[34m[AgentRuntime]\x1b[0m 🧠 Dispatching streaming LLM request to (${config.customLlmBaseUrl}) for sub-agent ${targetSubAgent}...`);
-      const stream = await openai.chat.completions.create(
-        {
-          model: config.customLlmModel,
-          messages,
-          temperature: 0.3,
-          max_tokens: 1800,
-          stream: true,
-        },
-        { signal: abortController.signal, timeout: 120000 }
-      );
-
+    // Streams one model call into the message being written. Returns why the model stopped: "stop" is a finished
+    // answer, "length" means it ran out of room mid-answer (the window or max_tokens), so the answer is incomplete.
+    const consume = async (stream: AsyncIterable<any>): Promise<string | null> => {
+      let finish: string | null = null;
       for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta as any;
+        const choice = chunk.choices?.[0];
+        if (choice?.finish_reason) finish = choice.finish_reason;
+        const delta = choice?.delta as any;
         const text = delta?.content || "";
         const reasoning = delta?.reasoning_content || "";
 
@@ -301,8 +395,8 @@ export async function sendMessage(
           reasoningBuffer += reasoning;
           if (!initialMessageEmitted) {
             initialMessageEmitted = true;
-            assistantText = "*Analyzing statutory provisions and case records...*\n\n";
-            emit({ type: "message", dotId, userId, data: { ...asstMsg, text: assistantText } });
+            // A visible placeholder only: the real answer replaces it, and it is never saved as an answer.
+            emit({ type: "message", vakilId, userId, data: { ...asstMsg, text: "*Analyzing statutory provisions and case records...*\n\n" } });
           }
         }
 
@@ -312,113 +406,148 @@ export async function sendMessage(
             generatedContent += text;
             assistantText = text;
             initialMessageEmitted = true;
-            emit({ type: "message", dotId, userId, data: { ...asstMsg, text: assistantText } });
+            emit({ type: "message", vakilId, userId, data: { ...asstMsg, text: assistantText } });
           } else {
             generatedContent += text;
             assistantText += text;
-            emit({ type: "message_delta", id: asstMsgId, dotId, userId, delta: text });
+            emit({ type: "message_delta", id: asstMsgId, vakilId, userId, delta: text });
           }
         }
       }
+      return finish;
+    };
 
-      // If the model generated all its response into reasoning_content without transitioning to content:
-      if (!hasReceivedContent && reasoningBuffer.trim()) {
-        console.log(`\x1b[33m[AgentRuntime] ℹ️ Model output was in reasoning_content (${reasoningBuffer.length} chars). Promoting to answer.\x1b[0m`);
-        generatedContent = reasoningBuffer.trim();
-        assistantText = generatedContent;
-        if (!initialMessageEmitted) {
-          initialMessageEmitted = true;
-          emit({ type: "message", dotId, userId, data: { ...asstMsg, text: assistantText } });
-        } else {
-          emit({ type: "message_delta", id: asstMsgId, dotId, userId, delta: generatedContent });
-        }
+    /** Marks an answer that stopped before it was finished, ending it at a full sentence. */
+    const markCutOff = () => {
+      if (!assistantText.trim()) return;
+      assistantText = endAtSentence(assistantText) + CUT_OFF_NOTICE;
+    };
+
+    try {
+      console.log(`\x1b[34m[AgentRuntime]\x1b[0m 🧠 Dispatching streaming LLM request to (${config.customLlmBaseUrl}) for sub-agent ${targetSubAgent}...`);
+      const stream = await openai.chat.completions.create(
+        {
+          model: config.customLlmModel,
+          messages,
+          temperature: 0.3,
+          max_tokens: Math.max(256, fitted.maxAnswerTokens),
+          stream: true,
+        },
+        { signal: abortController.signal, timeout: 120000 }
+      );
+
+      let finish = await consume(stream);
+
+      // The answer hit its length limit before it was finished: ask the model to carry on from where it stopped,
+      // as long as the window still has room. The prompt prefix is the same, so the server reuses its cache.
+      let continuations = 0;
+      while (finish === "length" && assistantText.trim() && continuations < MAX_CONTINUATIONS && !abortController.signal.aborted) {
+        const window = currentWindow();
+        const used = fitted.promptTokens + estimateTokens(assistantText) + estimateTokens(CONTINUE_PROMPT) + 24;
+        const room = Math.min(config.answerMaxTokens, window - used - safetyTokens(window));
+        if (room < MIN_CONTINUE_TOKENS) break;
+        continuations++;
+        console.log(`\x1b[34m[AgentRuntime]\x1b[0m ↪️ Answer hit its length limit; continuing (${continuations}/${MAX_CONTINUATIONS}, room for ${room} tokens)`);
+        const next = await openai.chat.completions.create(
+          {
+            model: config.customLlmModel,
+            messages: [...messages, { role: "assistant" as const, content: assistantText }, { role: "user" as const, content: CONTINUE_PROMPT }],
+            temperature: 0.3,
+            max_tokens: room,
+            stream: true,
+          },
+          { signal: abortController.signal, timeout: 120000 },
+        );
+        finish = await consume(next);
       }
+      // Still not finished (no room left): end at a full sentence and tell the user how to get the rest.
+      if (finish === "length") {
+        console.warn(`\x1b[33m[AgentRuntime]\x1b[0m ✂️ Answer reached the length limit after ${continuations} continuation(s)`);
+        markCutOff();
+      }
+
+      // Text the model produced only as "reasoning" is its private working, not an answer, so it is
+      // never shown as one. An empty answer falls through to the notice below.
 
       console.log(`\x1b[34m[AgentRuntime]\x1b[0m ⚡ LLM streaming completed in ${Date.now() - llmStartTime}ms (${assistantText.length} chars)`);
     } catch (llmErr: any) {
       if (llmErr.name === "AbortError" || abortController.signal.aborted) {
+        // Stopped by the user (or replaced by a newer message): keep the part already written instead of losing it.
+        if (assistantText.trim()) {
+          asstMsg.text = assistantText;
+          await insertMessage({ id: asstMsg.id, conversationId, userId, vakilId, role: "vakil", text: assistantText, citations, createdAt: asstMsg.createdAt }).catch(() => undefined);
+          emit({ type: "message", vakilId, userId, data: asstMsg });
+        }
         throw llmErr;
       }
 
       console.error(`\x1b[31m[AgentRuntime] ❌ LLM Inference Error:\x1b[0m`, llmErr.message);
 
-      // If context exceeded the LLM's context size, retry with isolated query
+      // The server says how big its window really is when a prompt does not fit: remember it for every later request.
+      const reportedWindow = windowFromError(llmErr.message);
+      if (reportedWindow && reportedWindow < currentWindow()) {
+        learnedWindow = reportedWindow;
+        console.warn(`\x1b[33m[AgentRuntime]\x1b[0m 📐 The model server's window is ${reportedWindow} tokens; using that from now on.`);
+      }
+
+      // If the prompt did not fit, try once more with a much smaller one (no chat history, sections at their minimum).
+      // Only before any answer text exists: a failure in the middle of an answer must not start a second answer.
       const isContextOverflow =
-        llmErr.status === 400 ||
-        llmErr.message?.includes("exceeds the available context size") ||
-        llmErr.message?.includes("context size");
+        !hasReceivedContent &&
+        (reportedWindow !== null || llmErr.status === 400 || llmErr.message?.includes("exceeds the available context size") || llmErr.message?.includes("context size"));
 
       if (isContextOverflow) {
-        console.warn(`\x1b[33m[AgentRuntime] ⚠️ Context overflow (${llmErr.message}). Retrying with isolated prompt...\x1b[0m`);
+        console.warn(`\x1b[33m[AgentRuntime] ⚠️ Context overflow (${llmErr.message}). Retrying with a minimal prompt...\x1b[0m`);
         try {
+          const small = fitPrompt({
+            sections,
+            history: [],
+            userText,
+            windowTokens: Math.floor(currentWindow() * 0.85),
+            answerTokens: Math.min(config.answerMaxTokens, 900),
+            minimal: true,
+          });
           const retryStream = await openai.chat.completions.create(
             {
               model: config.customLlmModel,
-              messages: [
-                messages[0], // system prompt
-                { role: "user" as const, content: userText }
-              ],
+              messages: small.messages,
               temperature: 0.3,
-              max_tokens: 1800,
+              max_tokens: Math.max(256, small.maxAnswerTokens),
               stream: true,
             },
             { signal: abortController.signal, timeout: 120000 }
           );
-
-          for await (const chunk of retryStream) {
-            const delta = chunk.choices[0]?.delta as any;
-            const text = delta?.content || "";
-            const reasoning = delta?.reasoning_content || "";
-            if (reasoning) reasoningBuffer += reasoning;
-
-            if (text) {
-              if (!hasReceivedContent) {
-                hasReceivedContent = true;
-                generatedContent += text;
-                assistantText = text;
-                initialMessageEmitted = true;
-                emit({ type: "message", dotId, userId, data: { ...asstMsg, text: assistantText } });
-              } else {
-                generatedContent += text;
-                assistantText += text;
-                emit({ type: "message_delta", id: asstMsgId, dotId, userId, delta: text });
-              }
-            }
-          }
-
-          if (!hasReceivedContent && reasoningBuffer.trim()) {
-            generatedContent = reasoningBuffer.trim();
-            assistantText = generatedContent;
-            if (!initialMessageEmitted) {
-              initialMessageEmitted = true;
-              emit({ type: "message", dotId, userId, data: { ...asstMsg, text: assistantText } });
-            } else {
-              emit({ type: "message_delta", id: asstMsgId, dotId, userId, delta: generatedContent });
-            }
-          }
+          const retryFinish = await consume(retryStream);
+          if (retryFinish === "length") markCutOff();
         } catch (retryErr: any) {
           console.warn(`[AgentRuntime] Retry also failed:`, retryErr.message);
         }
+      } else if (generatedContent.trim()) {
+        // The connection broke part-way through an answer: keep what was written and say it is not complete.
+        markCutOff();
       }
 
       if (!generatedContent.trim()) {
         console.warn(`\x1b[33m[AgentRuntime] ⚠️ LLM inference node offline at ${config.customLlmBaseUrl} (${llmErr.message}). Engaging Lirava Legal Knowledge Engine fallback.\x1b[0m`);
-        const fallbackText = generateLegalResponse(userText);
+        const fallbackText = OFFLINE_NOTICE + generateLegalResponse(userText);
+        // This text is a general reference, not an answer drawn from the retrieved sources, so it carries none.
+        citations = [];
+        asstMsg.citations = null;
         assistantText = fallbackText;
 
         const words = assistantText.split(" ");
         const firstChunk = words.slice(0, 3).join(" ") + (words.length > 3 ? " " : "");
         if (!initialMessageEmitted) {
           initialMessageEmitted = true;
-          emit({ type: "message", dotId, userId, data: { ...asstMsg, text: firstChunk } });
+          emit({ type: "message", vakilId, userId, data: { ...asstMsg, text: firstChunk } });
         } else {
-          emit({ type: "message_delta", id: asstMsgId, dotId, userId, delta: firstChunk });
+          emit({ type: "message_delta", id: asstMsgId, vakilId, userId, delta: firstChunk });
         }
 
         for (let i = 3; i < words.length; i += 3) {
           if (abortController.signal.aborted) break;
           const slice = words.slice(i, i + 3).join(" ") + (i + 3 < words.length ? " " : "");
-          emit({ type: "message_delta", id: asstMsgId, dotId, userId, delta: slice });
+          emit({ type: "message_delta", id: asstMsgId, vakilId, userId, delta: slice });
           await new Promise((r) => setTimeout(r, 10));
         }
       }
@@ -426,38 +555,96 @@ export async function sendMessage(
 
     if (!assistantText) {
       console.warn(`\x1b[33m[AgentRuntime] ⚠️ LLM returned empty response. Engaging Lirava Legal Knowledge Engine fallback.\x1b[0m`);
-      const fallbackText = generateLegalResponse(userText);
+      const fallbackText = OFFLINE_NOTICE + generateLegalResponse(userText);
+        // This text is a general reference, not an answer drawn from the retrieved sources, so it carries none.
+        citations = [];
+        asstMsg.citations = null;
       assistantText = fallbackText;
       if (!initialMessageEmitted) {
-        emit({ type: "message", dotId, userId, data: { ...asstMsg, text: assistantText } });
+        emit({ type: "message", vakilId, userId, data: { ...asstMsg, text: assistantText } });
       } else {
-        emit({ type: "message_delta", id: asstMsgId, dotId, userId, delta: assistantText });
+        emit({ type: "message_delta", id: asstMsgId, vakilId, userId, delta: assistantText });
       }
     }
 
     asstMsg.text = assistantText;
 
-    db.prepare(`
-      INSERT INTO messages (id, dot_id, conversation_id, role, text, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(asstMsg.id, asstMsg.dotId, asstMsg.conversationId ?? null, asstMsg.role, asstMsg.text, asstMsg.createdAt);
+    await insertMessage({
+      id: asstMsg.id,
+      conversationId,
+      userId,
+      vakilId,
+      role: "vakil",
+      text: asstMsg.text,
+      citations,
+      createdAt: asstMsg.createdAt,
+    });
+    await touchConversation(conversationId, userId);
 
-    emit({ type: "message", dotId, userId, data: asstMsg });
-    emit({ type: "dot_status", dotId, userId, data: { status: "idle" } });
+    // After the answer is saved (so the user never waits for it): fold older messages into the chat's summary
+    // once they no longer fit in the window.
+    void maybeSummarizeChat(conversationId, userId);
 
-    runState.running = false;
-    runState.abortController = null;
+    emit({ type: "message", vakilId, userId, data: asstMsg });
+    emit({ type: "vakil_status", vakilId, userId, data: { status: "idle" } });
+
+    if (runState.abortController === abortController) {
+      runState.running = false;
+      runState.abortController = null;
+    }
 
     return { userMessage: userMsg, assistantMessage: asstMsg };
   } catch (err: any) {
-    runState.running = false;
-    runState.abortController = null;
-    emit({ type: "dot_status", dotId, userId, data: { status: "idle" } });
+    if (runState.abortController === abortController) {
+      runState.running = false;
+      runState.abortController = null;
+    }
+    emit({ type: "vakil_status", vakilId, userId, data: { status: "idle" } });
 
-    if (err.name === "AbortError") {
+    // Pressing Stop is not a failure, whatever the HTTP client names the error it raises while cancelling.
+    if (err.name === "AbortError" || abortController.signal.aborted) {
       return { userMessage: userMsg };
     }
 
     throw err;
   }
+  };
+
+  const announce = (status: RunState["phase"]) => {
+    runState.phase = status;
+    emit({ type: "run_status", vakilId, userId, conversationId, data: { status } });
+  };
+
+  if (!options.background) {
+    announce("running");
+    try {
+      return await generate();
+    } finally {
+      announce("idle");
+    }
+  }
+
+  // Background mode: the question is already saved, so hand it back at once. The answer waits for a free
+  // slot (shown as "queued" when the model is busy), is generated, and arrives through the live stream.
+  announce(runQueue.wouldWait(userId) ? "queued" : "running");
+  void runQueue
+    .run(userId, async () => {
+      if (abortController.signal.aborted) return; // stopped while it was waiting
+      announce("running");
+      await generate();
+    })
+    .catch(async (err: unknown) => {
+      console.error("[AgentRuntime] background answer failed:", err instanceof Error ? err.message : err);
+      const failure = await insertMessage({
+        conversationId: conversationId!,
+        userId,
+        vakilId,
+        role: "vakil",
+        text: "I couldn't complete this answer. Please send your question again.",
+      }).catch(() => null);
+      if (failure) emit({ type: "message", vakilId, userId, data: failure });
+    })
+    .finally(() => announce("idle"));
+
+  return { userMessage: userMsg };
 }

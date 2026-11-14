@@ -1,142 +1,184 @@
-import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { config } from "./config.js";
+import { bodyLimit } from "hono/body-limit";
+import { secureHeaders } from "hono/secure-headers";
+import { HTTPException } from "hono/http-exception";
+import { config, isProduction } from "./config.js";
 import { agentRoutes } from "./routes/agent.routes.js";
 import { eventsRoutes } from "./routes/events.routes.js";
 import { legalRoutes } from "./routes/legal.routes.js";
 import { adminRoutes } from "./routes/admin.routes.js";
-import { dotsRoutes } from "./routes/dots.routes.js";
+import { vakilsRoutes } from "./routes/vakils.routes.js";
 import { conversationsRoutes } from "./routes/conversations.routes.js";
 import { mattersRoutes } from "./routes/matters.routes.js";
 import { artifactsRoutes } from "./routes/artifacts.routes.js";
 import { filesRoutes } from "./routes/files.routes.js";
 import { integrationsRoutes } from "./routes/integrations.routes.js";
 import { authRoutes } from "./routes/auth.routes.js";
+import { publicRoutes } from "./routes/public.routes.js";
+import { documentsRoutes } from "./routes/documents.routes.js";
+import { preferencesRoutes } from "./routes/preferences.routes.js";
 import { checkLlmHealth } from "./services/agent/client.js";
-import { getDb } from "./services/db/index.js";
 import { getSnapshot } from "./services/repo/index.js";
 import { seedLegalCorpus } from "./services/legal/corpus-seeder.js";
+import { requireAuth } from "./middleware/auth.js";
+import { pgData } from "./services/data/pg.js";
+import { runningFor } from "./services/agent/runtime.js";
+import { corsOrigin } from "./middleware/security.js";
+import { importLegacyChats, initChatStore } from "./services/chats/store.js";
+import { seedBuiltInProvisions } from "./services/legal/provisions.js";
+import { LEGAL_FOUNDATIONAL_CORPUS } from "./services/legal/corpus-seeder.js";
+import { getSql } from "./services/db/postgres.js";
 
 const app = new Hono();
 
-// Initialize DB schema on start
-getDb();
+// Vakils, matters, documents and files live in PostgreSQL too: create the tables, add the built-in Vakils,
+// and copy over anything from the old local file (once).
+if (config.nodeEnv !== "test") {
+  pgData().catch((err) => console.error("[soli-backend] Data storage is unavailable:", err.message));
+}
 
-// Seed legal corpus into Qdrant asynchronously if not already present
-seedLegalCorpus(false).catch((err) => {
-  console.warn("\x1b[33m[soli-backend] Auto-seeding warning:\x1b[0m", err.message);
-});
+// Chats live in PostgreSQL. Create the tables, then copy over any chats from the old local file (once).
+initChatStore()
+  .then(() => importLegacyChats())
+  .then((result) => {
+    if (result) {
+      console.log(
+        `[soli-backend] Imported local chats into PostgreSQL: ${result.conversations} conversations, ${result.messages} messages` +
+          (result.skippedUnowned ? ` (${result.skippedUnowned} unowned conversations skipped)` : ""),
+      );
+    }
+  })
+  .catch((err) => {
+    console.error("[soli-backend] Chat storage is unavailable:", err.message);
+  });
 
-// Global Request & Response Logger Middleware
-app.use("*", async (c, next) => {
-  const start = Date.now();
-  const method = c.req.method;
-  const path = c.req.path;
-  const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+// The built-in starter provisions are also kept in PostgreSQL, so statute search works without the embedding server.
+if (config.nodeEnv !== "test") {
+  seedBuiltInProvisions(LEGAL_FOUNDATIONAL_CORPUS as Parameters<typeof seedBuiltInProvisions>[0]).catch((err) =>
+    console.warn("[soli-backend] Could not store the starter provisions:", err.message),
+  );
+}
 
-  if (path !== "/api/events") {
-    console.log(`\x1b[90m[${timestamp}]\x1b[0m \x1b[35m➜\x1b[0m \x1b[1m${method}\x1b[0m \x1b[36m${path}\x1b[0m`);
-  }
+// Seed legal corpus into Qdrant asynchronously if not already present (skipped when Qdrant is not configured)
+if (config.qdrantUrl && config.nodeEnv !== "test") {
+  seedLegalCorpus(false).catch((err) => {
+    console.warn("[soli-backend] Auto-seeding warning:", err.message);
+  });
+}
 
-  await next();
+// ---------------- Global middleware ----------------
 
-  const elapsed = Date.now() - start;
-  const status = (c.res as any)?.status ?? 200;
-  const statusColor =
-    status >= 500
-      ? "\x1b[41m\x1b[37m"
-      : status >= 400
-      ? "\x1b[33m"
-      : status >= 300
-      ? "\x1b[34m"
-      : "\x1b[32m";
-  const reset = "\x1b[0m";
+app.use(
+  "*",
+  secureHeaders({
+    // This service returns JSON and file downloads, never pages.
+    // `sandbox` also covers file downloads: anything a browser opens from here runs with no privileges.
+    contentSecurityPolicy: { defaultSrc: ["'none'"], frameAncestors: ["'none'"], sandbox: [] },
+    strictTransportSecurity: isProduction ? "max-age=63072000; includeSubDomains" : false,
+    referrerPolicy: "no-referrer",
+    xFrameOptions: "DENY",
+  }),
+);
 
-  if (path !== "/api/events") {
-    console.log(
-      `\x1b[90m[${timestamp}]\x1b[0m \x1b[32m✔\x1b[0m ${statusColor}${status}${reset} \x1b[1m${method}\x1b[0m \x1b[36m${path}\x1b[0m \x1b[90m(${elapsed}ms)\x1b[0m`
-    );
-  }
-});
-
-// Global CORS Middleware
 app.use(
   "*",
   cors({
-    origin: (origin) => {
-      // Allow localhost or configured origins
-      if (!origin || origin.includes("localhost") || origin.includes("127.0.0.1")) {
-        return origin || "*";
-      }
-      const cleanOrigin = origin.replace(/\/$/, "");
-      return config.corsOrigins.includes(cleanOrigin) ? origin : null;
-    },
+    origin: (origin) => corsOrigin(origin),
     credentials: true,
-    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowHeaders: ["Content-Type", "Authorization", "x-soli-auth", "x-session-token"],
-  })
+    allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization", "x-session-token"],
+    maxAge: 600,
+  }),
 );
 
-// Global Error Handler
-app.onError((err, c) => {
-  console.error(`[soli-backend] Uncaught error on ${c.req.method} ${c.req.url}:`, err);
-  return c.json(
-    {
-      error: err.message || "Internal Server Error",
-      timestamp: new Date().toISOString(),
-    },
-    500
-  );
+// Request size limits: small for JSON, larger only for file uploads.
+app.use("/api/*", async (c, next) => {
+  const isUpload = (c.req.header("content-type") || "").toLowerCase().startsWith("multipart/form-data");
+  const limit = isUpload ? config.maxUploadBytes * 10 + 1024 * 1024 : 2 * 1024 * 1024;
+  return bodyLimit({
+    maxSize: limit,
+    onError: (ctx) => ctx.json({ error: "The request is too large." }, 413),
+  })(c, next);
 });
 
-// Root & Health Checks
-app.get("/", (c) => {
-  return c.json({
-    service: "soli-backend",
-    version: "1.0.0",
-    description: "Soli Legal AI Platform Standalone Backend",
-    status: "running",
-    port: config.port,
-    endpoints: {
-      auth: "/api/auth",
-      agent: "/api/agent",
-      events: "/api/events",
-      legal: "/api/legal",
-      admin: "/api/admin",
-      ping: "/api/ping",
-    },
-  });
+// Request log: one line per request, no ANSI colours in production, quiet for the long-lived event stream.
+app.use("*", async (c, next) => {
+  const start = Date.now();
+  await next();
+  if (c.req.path === "/api/events" || c.req.path === "/health") return;
+  const status = c.res.status;
+  if (isProduction) {
+    console.log(JSON.stringify({ t: new Date().toISOString(), method: c.req.method, path: c.req.path, status, ms: Date.now() - start }));
+  } else {
+    console.log(`${c.req.method} ${c.req.path} ${status} (${Date.now() - start}ms)`);
+  }
 });
+
+app.onError((err, c) => {
+  if (err instanceof HTTPException) {
+    return c.json({ error: err.message || "Request failed" }, err.status);
+  }
+  console.error(`[soli-backend] Uncaught error on ${c.req.method} ${c.req.path}:`, err);
+  // Internal details (stack traces, SQL, hostnames) stay in the server log.
+  return c.json({ error: "Internal Server Error" }, 500);
+});
+
+app.notFound((c) => c.json({ error: "Not found" }, 404));
+
+// ---------------- Health ----------------
+
+/** Liveness: the process is up. No dependencies are touched. */
+app.get("/health", (c) => c.json({ status: "ok", uptimeSeconds: Math.floor(process.uptime()) }));
+
+/** Readiness: the dependencies a request needs are reachable. */
+app.get("/ready", async (c) => {
+  const checks: Record<string, "ok" | "down"> = {};
+  try {
+    const sql = getSql();
+    if (!sql) throw new Error("no database");
+    await sql`SELECT 1`;
+    checks.postgres = "ok";
+  } catch {
+    checks.postgres = "down";
+  }
+  const ready = checks.postgres === "ok";
+  return c.json({ status: ready ? "ready" : "not_ready", checks }, ready ? 200 : 503);
+});
+
+app.get("/", (c) => c.json({ service: "soli-backend", status: "running" }));
 
 app.get("/api/ping", async (c) => {
   const llm = await checkLlmHealth();
   return c.json({
     service: "soli-backend",
     status: "online",
-    llm,
+    // Only whether the model answers: its address and any error text stay private.
+    llm: { status: llm.status },
     uptimeSeconds: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
   });
 });
 
-// Mount Routes
+// ---------------- Routes ----------------
 app.route("/api/auth", authRoutes);
+app.route("/api/public", publicRoutes);
 app.route("/api/agent", agentRoutes);
 app.route("/api/events", eventsRoutes);
 app.route("/api/legal", legalRoutes);
 app.route("/api/admin", adminRoutes);
-app.route("/api/dots", dotsRoutes);
-app.route("/api/agents", dotsRoutes);
+app.route("/api/vakils", vakilsRoutes);
 app.route("/api/conversations", conversationsRoutes);
 app.route("/api/matters", mattersRoutes);
 app.route("/api/artifacts", artifactsRoutes);
 app.route("/api/files", filesRoutes);
+app.route("/api/documents", documentsRoutes);
+app.route("/api/preferences", preferencesRoutes);
 app.route("/api", integrationsRoutes);
 
-app.get("/api/snapshot", (c) => {
-  const userId = c.req.query("userId") || "";
-  return c.json(getSnapshot(userId));
+app.get("/api/snapshot", requireAuth, async (c) => {
+  const userId = c.get("user").id;
+  return c.json({ ...(await getSnapshot(userId)), running: runningFor(userId) });
 });
 
 export default app;

@@ -1,8 +1,10 @@
 process.env.NODE_ENV = "test";
 
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
+import { pgData } from "../src/services/data/pg.js";
 import assert from "node:assert/strict";
 import app from "../src/index.js";
+import { createTestAdmin, createTestUser } from "./helpers.js";
 import { generateCourtPdf, generateCourtDocx } from "../src/services/legal/court-engine.js";
 import { createApiKey } from "../src/services/admin/api-keys.js";
 import { registerModel } from "../src/services/admin/model-registry.js";
@@ -64,8 +66,19 @@ describe("Soli Standalone Backend Service", () => {
     assert.ok(docxBuf.length > 500);
   });
 
-  it("should register models in SQLite and query via admin API", async () => {
-    const model = registerModel({
+  // The admin tests register a model, a node and a key; remove them so the admin app does not fill up with test data.
+  const createdModels: string[] = [];
+  const createdNodes: string[] = [];
+  after(async () => {
+    const sql = await pgData();
+    if (createdModels.length) await sql`DELETE FROM app_models WHERE id IN ${sql(createdModels)}`;
+    if (createdNodes.length) await sql`DELETE FROM app_nodes WHERE id IN ${sql(createdNodes)}`;
+    await sql`DELETE FROM app_api_keys WHERE organization_id = ${"org-test"}`;
+    await sql`DELETE FROM app_audit_events WHERE organization_id = ${"org-test"}`;
+  });
+
+  it("should register models and query them via the admin API", async () => {
+    const model = await registerModel({
       name: "Qwen 2.5 7B Instruct",
       gguf_file: "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
       storage_path: "/home/ritvox/LLM-Server/models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
@@ -74,8 +87,10 @@ describe("Soli Standalone Backend Service", () => {
     });
 
     assert.ok(model.id);
+    createdModels.push(model.id);
 
-    const res = await app.request("/api/admin/models");
+    const admin = await createTestAdmin("models");
+    const res = await app.request("/api/admin/models", { headers: admin.headers });
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.ok(Array.isArray(body.models));
@@ -83,21 +98,23 @@ describe("Soli Standalone Backend Service", () => {
   });
 
   it("should register and toggle inference nodes", async () => {
-    const node = registerNode({
+    const node = await registerNode({
       name: "Local Node 1 (RTX 4090)",
       address: "10.10.0.247:8082",
     });
 
     assert.ok(node.id);
+    createdNodes.push(node.id);
 
-    const drainRes = await app.request(`/api/admin/nodes/${node.id}/drain`, { method: "POST" });
+    const admin = await createTestAdmin("nodes");
+    const drainRes = await app.request(`/api/admin/nodes/${node.id}/drain`, { method: "POST", headers: admin.headers });
     assert.equal(drainRes.status, 200);
     const drainBody = await drainRes.json();
     assert.equal(drainBody.is_draining, 1);
   });
 
   it("should create high-entropy hashed API key and verify secrets are never stored in plaintext", async () => {
-    const { record, fullSecret } = createApiKey({
+    const { record, fullSecret } = await createApiKey({
       organizationId: "org-test",
       name: "Test Production Key",
       scopes: ["chat", "rag", "documents"],
@@ -106,7 +123,8 @@ describe("Soli Standalone Backend Service", () => {
     assert.ok(fullSecret.startsWith("soli_live_"));
     assert.equal(record.name, "Test Production Key");
 
-    const res = await app.request("/api/admin/api-keys?orgId=org-test");
+    const admin = await createTestAdmin("keys");
+    const res = await app.request("/api/admin/api-keys?orgId=org-test", { headers: admin.headers });
     assert.equal(res.status, 200);
     const body = await res.json();
     const retrieved = body.keys.find((k: any) => k.id === record.id);
@@ -117,14 +135,20 @@ describe("Soli Standalone Backend Service", () => {
   });
 
   it("should provide authoritative legal consultation when LLM node is offline without exposing raw node diagnostics", { timeout: 120000 }, async () => {
+    const user = await createTestUser("consult");
+    const convId = `conv_test_${Date.now()}`;
+    await app.request("/api/conversations", {
+      method: "POST",
+      headers: user.headers,
+      body: JSON.stringify({ vakilId: "dot_test", id: convId }),
+    });
     const res = await app.request("/api/agent/message", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: user.headers,
       body: JSON.stringify({
-        dotId: "dot_test",
+        vakilId: "dot_test",
         text: "Please analyze the bail provisions under Section 482 of BNSS.",
-        userId: "usr_test",
-        conversationId: "conv_test",
+        conversationId: convId,
       }),
     });
 
@@ -134,8 +158,8 @@ describe("Soli Standalone Backend Service", () => {
     assert.equal(body.userMessage.role, "user");
     assert.equal(body.userMessage.text, "Please analyze the bail provisions under Section 482 of BNSS.");
     assert.ok(body.assistantMessage);
-    assert.equal(body.assistantMessage.role, "dot");
-    assert.equal(body.assistantMessage.conversationId, "conv_test");
+    assert.equal(body.assistantMessage.role, "vakil");
+    assert.equal(body.assistantMessage.conversationId, convId);
     // Verify professional legal analysis is provided
     assert.ok(body.assistantMessage.text.includes("Bail") || body.assistantMessage.text.includes("bail"));
     assert.ok(body.assistantMessage.text.includes("Bharatiya Nagarik Suraksha Sanhita") || body.assistantMessage.text.includes("BNSS"));

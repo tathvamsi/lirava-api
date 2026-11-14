@@ -4,21 +4,29 @@ import { retrieveLegalContext } from "../services/legal/rag.js";
 import { seedLegalCorpus } from "../services/legal/corpus-seeder.js";
 import { generateCourtPdf, generateCourtDocx, type LegalPleadingData } from "../services/legal/court-engine.js";
 import { config } from "../config.js";
+import { OFFLINE_NOTICE } from "../services/legal/notice.js";
+import { requireAuth, type AuthEnv } from "../middleware/auth.js";
+import { rateLimit, requireAdmin } from "../middleware/security.js";
 
-export const legalRoutes = new Hono();
+export const legalRoutes = new Hono<AuthEnv>();
+
+// Everything here uses the model, the vector store or document generation: sign-in is required.
+legalRoutes.use("*", requireAuth);
+legalRoutes.use("/answer", rateLimit("legal-answer", 40, 60 * 1000));
+legalRoutes.use("/search", rateLimit("legal-search", 60, 60 * 1000));
 
 // Semantic Statutory RAG Search
 legalRoutes.get("/search", async (c) => {
   const query = c.req.query("q") || "";
   const act = c.req.query("act");
-  const limit = Number(c.req.query("limit") || 5);
+  const limit = Math.min(Math.max(Number(c.req.query("limit") || 5) || 5, 1), 20);
 
   const results = await searchStatutes(query, limit, act);
   return c.json({ query, results });
 });
 
 // Full RAG Context Inspector
-legalRoutes.get("/rag-context", async (c) => {
+legalRoutes.get("/rag-context", requireAdmin, async (c) => {
   const query = c.req.query("q") || "";
   if (!query) return c.json({ error: "Query parameter 'q' is required" }, 400);
 
@@ -30,9 +38,12 @@ legalRoutes.get("/rag-context", async (c) => {
 legalRoutes.post("/answer", async (c) => {
   try {
     const body = await c.req.json();
-    const question = (body.question || "").trim();
+    const question = (typeof body.question === "string" ? body.question : "").trim();
     if (!question) {
       return c.json({ error: "question is required" }, 400);
+    }
+    if (question.length > 4000) {
+      return c.json({ error: "The question is too long." }, 413);
     }
 
     const ragResult = await retrieveLegalContext(question, 1400);
@@ -55,12 +66,15 @@ legalRoutes.post("/answer", async (c) => {
           { role: "user", content: prompt },
         ],
         temperature: 0.2,
-        max_tokens: 1024,
+        // A reasoning model spends part of this thinking before it writes the answer.
+        max_tokens: 3000,
       });
-      answer = completion.choices[0]?.message?.content || "";
+      answer = (completion.choices[0]?.message?.content || "").trim();
+      // An empty reply (the model used its whole budget thinking) is a failure, not an answer.
+      if (!answer) throw new Error("The model returned no answer text.");
     } catch {
       const { generateLegalResponse } = await import("../services/legal/knowledge.js");
-      answer = generateLegalResponse(question);
+      answer = OFFLINE_NOTICE + generateLegalResponse(question);
     }
 
     const citations = (ragResult?.sources || []).map((s) => ({
@@ -78,12 +92,13 @@ legalRoutes.post("/answer", async (c) => {
       status: "complete",
     });
   } catch (err: any) {
-    return c.json({ error: err.message || "Failed to answer legal question" }, 500);
+    console.error("[legal] answer failed:", err);
+    return c.json({ error: "Failed to answer legal question" }, 500);
   }
 });
 
 // Seed / Re-seed Legal Corpus
-legalRoutes.post("/seed", async (c) => {
+legalRoutes.post("/seed", requireAdmin, async (c) => {
   const force = c.req.query("force") === "true";
   const result = await seedLegalCorpus(force);
   return c.json(result);
@@ -102,7 +117,9 @@ legalRoutes.post("/generate-pdf", async (c) => {
       },
     });
   } catch (err: any) {
-    return c.json({ error: err.message || "Failed to generate PDF" }, 500);
+    if (err?.name === "UnsupportedTextError" || err instanceof SyntaxError) return c.json({ error: err.message || "Invalid pleading data" }, 422);
+    console.error("[legal] PDF generation failed:", err);
+    return c.json({ error: "Failed to generate PDF" }, 500);
   }
 });
 
@@ -119,6 +136,8 @@ legalRoutes.post("/generate-docx", async (c) => {
       },
     });
   } catch (err: any) {
-    return c.json({ error: err.message || "Failed to generate DOCX" }, 500);
+    if (err instanceof SyntaxError) return c.json({ error: "Invalid pleading data" }, 422);
+    console.error("[legal] DOCX generation failed:", err);
+    return c.json({ error: "Failed to generate DOCX" }, 500);
   }
 });

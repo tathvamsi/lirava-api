@@ -1,0 +1,3 @@
+/** Shown ahead of any answer produced without the AI model, so a canned reference is never mistaken for AI analysis of the user's question. */
+export const OFFLINE_NOTICE =
+  "> **The AI model is not available right now.** The text below is a general reference summary from Lirava's built-in statute library. It is not an analysis of your specific question. Please verify against the bare Act before relying on it.\n\n";

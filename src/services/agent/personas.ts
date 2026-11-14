@@ -1,7 +1,7 @@
 import type { SubAgentId } from "./router.js";
 
-export function getAgentPersonaPrompt(dotId: string, subAgentTarget?: SubAgentId | string): string {
-  const target = (subAgentTarget || dotId).toLowerCase();
+export function getAgentPersonaPrompt(vakilId: string, subAgentTarget?: SubAgentId | string): string {
+  const target = (subAgentTarget || vakilId).toLowerCase();
 
   const isVakil = target.startsWith("vakil") || target.includes("draft");
   const isNyaya = target.startsWith("nyaya") || target.includes("research");
