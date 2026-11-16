@@ -8,8 +8,7 @@ import {
   type Citation,
   createConversation,
   getConversation,
-  getChatSummary,
-  historyAfter,
+  getChatContext,
   insertMessage,
   latestConversationId,
   touchConversation,
@@ -38,6 +37,15 @@ import { extractTextFromFile, type Attachment } from "../files/index.js";
 import { isImageName, loadImageParts, type ImagePart } from "./vision.js";
 import crypto from "node:crypto";
 import { RunQueue } from "./queue.js";
+
+/** The promise's value, or `fallback` if it takes longer than `ms`. The timer is cleared either way. */
+function withTimeout<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
 
 export interface MessageRecord {
   id: string;
@@ -157,16 +165,20 @@ export async function sendMessage(
 
   // 1. Insert User Message
   const now = Date.now();
-  const stored = await insertMessage({
-    id: clientMsgId,
-    conversationId,
-    userId,
-    vakilId,
-    role: "user",
-    text: userText,
-    attachments: attachments && attachments.length > 0 ? attachments : null,
-    createdAt: now,
-  });
+  // The message is stored and the chat's recency stamp (which the sidebar orders by) refreshed in the same step.
+  const [stored] = await Promise.all([
+    insertMessage({
+      id: clientMsgId,
+      conversationId,
+      userId,
+      vakilId,
+      role: "user",
+      text: userText,
+      attachments: attachments && attachments.length > 0 ? attachments : null,
+      createdAt: now,
+    }),
+    touchConversation(conversationId, userId, now),
+  ]);
   const userMsg: MessageRecord = {
     id: stored.id,
     vakilId: vakilId,
@@ -179,9 +191,6 @@ export async function sendMessage(
     createdAt: now,
     created_at: now,
   };
-
-  // Keep the conversation's recency stamp fresh so the sidebar can order by it.
-  await touchConversation(conversationId, userId, now);
 
   emit({ type: "message", vakilId, userId, data: userMsg });
   emit({ type: "vakil_status", vakilId, userId, data: { status: "thinking" } });
@@ -228,8 +237,7 @@ export async function sendMessage(
   const generate = async (): Promise<{ userMessage: MessageRecord; assistantMessage?: MessageRecord }> => {
   // 2. Chat history. Older messages live on as a running summary saved with the chat; the messages after it are
   // loaded here (this user's own conversation only) and the newest ones that fit the model's window are used.
-  const { summary: chatSummary, upto: summaryUpto } = await getChatSummary(conversationId, userId).catch(() => ({ summary: "", upto: 0 }));
-  const historyRows = await historyAfter(conversationId, userId, userMsg.id, summaryUpto, 40);
+  const { summary: chatSummary, history: historyRows } = await getChatContext(conversationId, userId, userMsg.id, 40);
 
   // Sanitize history to prevent pattern poisoning: leave out repeated identical questions, stored fallback
   // messages and raw clause dumps (see toTurn). Long messages are shortened per message, not dropped.
@@ -242,10 +250,12 @@ export async function sendMessage(
 
   // 3. Tie the attached documents to this chat and matter so they stay searchable in later questions.
   const attachedIds = (attachments ?? []).map((att) => att.id);
-  await linkDocuments(userId, attachedIds, conversationId, conversation.matterId ?? null).catch((err) =>
-    console.warn("[AgentRuntime] could not link documents:", err.message),
-  );
-  const indexed = await indexedStatus(userId, attachedIds).catch(() => new Map<string, string>());
+  const [, indexed] = await Promise.all([
+    linkDocuments(userId, attachedIds, conversationId, conversation.matterId ?? null).catch((err) =>
+      console.warn("[AgentRuntime] could not link documents:", err.message),
+    ),
+    indexedStatus(userId, attachedIds).catch(() => new Map<string, string>()),
+  ]);
 
   // Files whose text is not indexed (unsupported or unreadable) are still read directly, as before.
   let attachedDocumentContext = "";
@@ -310,12 +320,18 @@ export async function sendMessage(
       recent: cleanHistory.map((m) => m.content),
     });
     console.log(`\x1b[35m[RetrievalGate]\x1b[0m 🧭 statutes=${gate.statutes ? "search" : "skip"}, documents=${gate.documents ? "search" : "skip"} (${gate.reason})`);
-    const ragResult = !gate.statutes
-      ? null
-      : await Promise.race([
-          retrieveLegalContext(userText).catch(() => null),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), config.upstreamTimeoutMs * 2)),
-        ]);
+    // The statute library (vector + text search) and the user's own documents are independent, so they are searched
+    // at the same time; each has its own time limit and falls back to "nothing found" rather than stalling the answer.
+    const [ragResult, documentHits] = await Promise.all([
+      gate.statutes ? withTimeout(retrieveLegalContext(userText).catch(() => null), config.upstreamTimeoutMs * 2, null) : Promise.resolve(null),
+      gate.documents
+        ? withTimeout(
+            searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null }, userText, 5).catch(() => [] as DocumentHit[]),
+            config.upstreamTimeoutMs,
+            [] as DocumentHit[],
+          )
+        : Promise.resolve([] as DocumentHit[]),
+    ]);
     if (ragResult) {
       console.log(
         `\x1b[32m[AgentRuntime]\x1b[0m 📚 Legal Vector RAG retrieved context (${ragResult.sources.length} sources, ${ragResult.contextText.length} chars)`
@@ -332,12 +348,7 @@ export async function sendMessage(
     }
 
     // 2. Passages of this user's documents (attached to this chat, or in its matter) that match the question
-    const documentHits: DocumentHit[] = !gate.documents
-      ? []
-      : await Promise.race([
-          searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null }, userText, 5).catch(() => [] as DocumentHit[]),
-          new Promise<DocumentHit[]>((resolve) => setTimeout(() => resolve([]), config.upstreamTimeoutMs)),
-        ]);
+    // (searched above, together with the statutes).
     const documentContext = buildDocumentContext(documentHits);
     let citations: Citation[] = [...documentContext.citations, ...statuteCitations(ragResult?.sources)];
 

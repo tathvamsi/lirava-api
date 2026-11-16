@@ -54,13 +54,6 @@ export async function findUserByEmail(email: string): Promise<UserRow | null> {
   return rows[0] ?? null;
 }
 
-export async function findUserById(id: string): Promise<UserRow | null> {
-  const rows = await db()<UserRow[]>`
-    SELECT id, name, email, password_hash, role, created_at, updated_at
-    FROM users WHERE id = ${id} LIMIT 1`;
-  return rows[0] ?? null;
-}
-
 export async function insertUser(user: {
   id?: string;
   name: string;

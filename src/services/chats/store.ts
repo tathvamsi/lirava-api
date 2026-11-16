@@ -320,22 +320,6 @@ export async function listRecentMessages(userId: string, limit = 200): Promise<M
   return rows.reverse().map(toMessage);
 }
 
-/** Prior turns for building the model prompt, oldest first. */
-export async function recentHistory(
-  conversationId: string,
-  userId: string,
-  excludeMessageId: string,
-  limit: number,
-): Promise<Array<{ role: string; text: string }>> {
-  const uid = requireUser(userId);
-  const sql = await pg();
-  const rows = await sql`
-    SELECT role, text FROM chat_messages
-    WHERE conversation_id = ${conversationId} AND user_id = ${uid} AND id <> ${excludeMessageId}
-    ORDER BY created_at DESC LIMIT ${limit}`;
-  return rows.map((r) => ({ role: r.role as string, text: r.text as string })).reverse();
-}
-
 /** The running summary of this chat's older messages, and the time of the last message it covers. */
 export async function getChatSummary(conversationId: string, userId: string): Promise<{ summary: string; upto: number }> {
   const uid = requireUser(userId);
@@ -372,6 +356,41 @@ export async function historyAfter(
   return rows.map((r) => ({ role: r.role as string, text: r.text as string, createdAt: Number(r.created_at) })).reverse();
 }
 
+/**
+ * Everything the prompt needs from the chat in one query: the running summary and the newest `limit` messages after
+ * it (oldest first). One statement means one round trip, and the summary and its cut-off point always agree even if
+ * a background summary update lands while this runs.
+ */
+export async function getChatContext(
+  conversationId: string,
+  userId: string,
+  excludeMessageId: string,
+  limit: number,
+): Promise<{ summary: string; upto: number; history: Array<{ role: string; text: string; createdAt: number }> }> {
+  const uid = requireUser(userId);
+  const sql = await pg();
+  const rows = await sql`
+    SELECT c.summary, c.summary_upto,
+      COALESCE((
+        SELECT json_agg(json_build_object('role', t.role, 'text', t.text, 'createdAt', t.created_at) ORDER BY t.created_at)
+        FROM (
+          SELECT role, text, created_at FROM chat_messages
+          WHERE conversation_id = c.id AND user_id = c.user_id AND id <> ${excludeMessageId} AND created_at > c.summary_upto
+          ORDER BY created_at DESC LIMIT ${limit}
+        ) t
+      ), '[]'::json) AS history
+    FROM chat_conversations c
+    WHERE c.id = ${conversationId} AND c.user_id = ${uid}
+    LIMIT 1`;
+  const row = rows[0];
+  const history = (Array.isArray(row?.history) ? row.history : []) as Array<{ role: string; text: string; createdAt: number | string }>;
+  return {
+    summary: (row?.summary as string | null) ?? "",
+    upto: Number(row?.summary_upto ?? 0),
+    history: history.map((m) => ({ role: m.role, text: m.text, createdAt: Number(m.createdAt) })),
+  };
+}
+
 export async function insertMessage(input: {
   id?: string;
   conversationId: string;
@@ -386,22 +405,24 @@ export async function insertMessage(input: {
   const uid = requireUser(input.userId);
   const sql = await pg();
 
-  // The conversation must exist and belong to this user before anything is written to it.
-  const owned = await getConversation(input.conversationId, uid);
-  if (!owned) throw new ChatError(404, "Conversation not found.");
-
   const createdAt = input.createdAt ?? Date.now();
   let id = input.id?.trim() || `msg-${crypto.randomUUID()}`;
   const attachments = input.attachments && input.attachments.length ? sql.json(input.attachments as any) : null;
   const citations = input.citations && input.citations.length ? sql.json(input.citations as any) : null;
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    // One statement both checks that the chat exists and is this user's (the SELECT matches no row otherwise) and
+    // writes the message, so the usual case needs a single round trip instead of a lookup first.
     const rows = await sql`
       INSERT INTO chat_messages (id, conversation_id, user_id, vakil_id, role, text, attachments, citations, created_at)
-      VALUES (${id}, ${input.conversationId}, ${uid}, ${input.vakilId}, ${input.role}, ${input.text}, ${attachments}, ${citations}, ${createdAt})
+      SELECT ${id}::text, c.id, c.user_id, ${input.vakilId}::text, ${input.role}::text, ${input.text}::text, ${attachments}::jsonb, ${citations}::jsonb, ${createdAt}::bigint
+      FROM chat_conversations c
+      WHERE c.id = ${input.conversationId} AND c.user_id = ${uid}
       ON CONFLICT (id) DO NOTHING
       RETURNING *`;
     if (rows[0]) return toMessage(rows[0]);
+    // Nothing was written: either the chat is not this user's (or does not exist), or the message id is taken.
+    if (attempt === 0 && !(await getConversation(input.conversationId, uid))) throw new ChatError(404, "Conversation not found.");
     // The id is taken. If it is this user's own copy of this same message (a retry after a timeout), return it
     // instead of storing the question twice. If it belongs to anyone else, never touch it: use a fresh id.
     if (attempt === 0 && input.id) {

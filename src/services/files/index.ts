@@ -10,12 +10,6 @@ export interface Attachment {
   size: number;
 }
 
-export interface FileRecord extends Attachment {
-  vakilId: string;
-  userId: string;
-  createdAt: number;
-}
-
 export function guessMime(name: string): string {
   const ext = path.extname(name).toLowerCase();
   const map: Record<string, string> = {
@@ -130,12 +124,4 @@ export async function deleteFilesForUser(fileIds: string[], userId: string): Pro
   const sql = await pgData();
   const rows = await sql`DELETE FROM app_files WHERE user_id = ${userId} AND id = ANY(${fileIds}) RETURNING id`;
   return rows.length;
-}
-
-/** Removes a file the user owns. */
-export async function deleteFileForUser(fileId: string, userId: string): Promise<boolean> {
-  if (!userId) return false;
-  const sql = await pgData();
-  const rows = await sql`DELETE FROM app_files WHERE id = ${fileId} AND user_id = ${userId} RETURNING id`;
-  return rows.length > 0;
 }

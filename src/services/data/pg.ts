@@ -212,18 +212,6 @@ export async function importLegacyData(force = false): Promise<{ vakils: number;
   return counts;
 }
 
-/** A small system setting, e.g. whether an import has already run. */
-export async function getSetting(key: string): Promise<string | null> {
-  const sql = await pgData();
-  const rows = await sql`SELECT value FROM app_settings WHERE key = ${key}`;
-  return rows[0] ? (rows[0].value as string) : null;
-}
-
-export async function setSetting(key: string, value: string): Promise<void> {
-  const sql = await pgData();
-  await sql`INSERT INTO app_settings (key, value) VALUES (${key}, ${value}) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
-}
-
 type LegacyDb = NonNullable<ReturnType<typeof getLegacyDb>>;
 
 /** Copies administrator and connector settings from the old local file. Existing rows are never overwritten. */

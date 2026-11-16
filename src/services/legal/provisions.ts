@@ -192,17 +192,5 @@ export async function searchProvisions(question: string, limit = 4): Promise<Pro
   }));
 }
 
-export async function deleteProvisionsForDocument(documentId: string): Promise<number> {
-  const sql = await pg();
-  const rows = await sql`DELETE FROM legal_provisions WHERE document_id = ${documentId} RETURNING id`;
-  return rows.length;
-}
-
 /** The shared connection for the corpus tools. */
 export const provisionsDb = pg;
-
-export async function countProvisions(): Promise<number> {
-  const sql = await pg();
-  const [row] = await sql`SELECT COUNT(*)::int AS n FROM legal_provisions`;
-  return Number(row?.n ?? 0);
-}
