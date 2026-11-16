@@ -1,5 +1,5 @@
 import { getLlmClient } from "./client.js";
-import { getMatterForUser } from "../repo/index.js";
+import { getMatterForUser, noteMatterAnswered, noteMatterWorkStarted } from "../repo/index.js";
 import { emit } from "../bus/index.js";
 import { buildDocumentContext, statuteCitations } from "../documents/context.js";
 import { indexedStatus, linkDocuments, searchDocuments, type DocumentHit } from "../documents/index.js";
@@ -26,6 +26,8 @@ import {
   type PromptSection,
 } from "./context-budget.js";
 import { maybeSummarizeChat, toTurn } from "./summary.js";
+import { classifySmallTalk, smallTalkReply } from "./smalltalk.js";
+import { decideRetrieval } from "./retrieval-gate.js";
 import { config } from "../../config.js";
 import { generateLegalResponse } from "../legal/knowledge.js";
 import { OFFLINE_NOTICE } from "../legal/notice.js";
@@ -33,6 +35,7 @@ import { retrieveLegalContext, type RetrievedLegalContext } from "../legal/rag.j
 import { getAgentPersonaPrompt } from "./personas.js";
 import { routeLegalTask, type RoutingDecision } from "./router.js";
 import { extractTextFromFile, type Attachment } from "../files/index.js";
+import { isImageName, loadImageParts, type ImagePart } from "./vision.js";
 import crypto from "node:crypto";
 import { RunQueue } from "./queue.js";
 
@@ -150,6 +153,8 @@ export async function sendMessage(
 
   console.log(`\x1b[34m[AgentRuntime]\x1b[0m 💬 Prompt received for vakil=${vakilId} conv=${conversationId || "none"}: "${userText.slice(0, 75)}${userText.length > 75 ? "..." : ""}" (attachments: ${attachments?.length || 0})`);
 
+  if (matterId) void noteMatterWorkStarted(matterId, userId, conversationId, userText).catch(() => undefined);
+
   // 1. Insert User Message
   const now = Date.now();
   const stored = await insertMessage({
@@ -180,8 +185,11 @@ export async function sendMessage(
 
   emit({ type: "message", vakilId, userId, data: userMsg });
   emit({ type: "vakil_status", vakilId, userId, data: { status: "thinking" } });
-  if (/^(hi|hello|hey|greetings|good\s+(morning|afternoon|evening))[.!?\s]*$/i.test(userText.trim())) {
-    const greetingText = "Hello. I'm Lirava. How can I help with your legal matter today?";
+  // Greetings, "what is your name?" and thanks get a fixed reply: no model call, and no statute attached as a source.
+  const smallTalk = classifySmallTalk(userText);
+  const cannedText = smallTalkReply(smallTalk);
+  if (cannedText) {
+    const greetingText = cannedText;
     const assistantId = `msg-${crypto.randomUUID()}`;
     const assistantTime = Date.now();
     const assistantMessage: MessageRecord = {
@@ -241,13 +249,30 @@ export async function sendMessage(
 
   // Files whose text is not indexed (unsupported or unreadable) are still read directly, as before.
   let attachedDocumentContext = "";
+  const imageFiles: Array<{ id: string; name: string }> = [];
+  let unreadableImages: string[] = [];
+  let imageParts: ImagePart[] = [];
+  let imageNames: string[] = [];
   if (attachments && attachments.length > 0) {
     for (const att of attachments) {
       if (indexed.get(att.id) === "ready") continue;
       const extracted = await extractTextFromFile(att.id, userId);
+      if (!extracted.trim() && isImageName(att.name)) imageFiles.push({ id: att.id, name: att.name });
       if (extracted.trim()) {
         attachedDocumentContext += `\n\n[USER ATTACHED DOCUMENT: ${att.name}]\n${extracted.trim()}\n[END OF ATTACHED DOCUMENT]`;
       }
+    }
+  }
+
+  // Images: a vision model is sent them with the question; any other model is told plainly it cannot read them.
+  if (imageFiles.length > 0) {
+    if (config.visionEnabled) {
+      const loaded = await loadImageParts(imageFiles, userId);
+      imageParts = loaded.parts;
+      imageNames = loaded.names;
+      unreadableImages = loaded.skipped;
+    } else {
+      unreadableImages = imageFiles.map((f) => f.name);
     }
   }
 
@@ -272,10 +297,21 @@ export async function sendMessage(
     }
 
     // 1. Retrieve RAG context from vector legal corpus (Qdrant) and ingested vault
-    const ragResult = await Promise.race([
-      retrieveLegalContext(userText).catch(() => null),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), config.upstreamTimeoutMs * 2)),
-    ]);
+    // Decide first whether this message needs the legal knowledge base at all. A general or casual message searches
+    // nothing, so it answers faster and no unrelated statute is attached to it as a source.
+    const gate = decideRetrieval({
+      text: userText,
+      hasAttachments: (attachments?.length ?? 0) > 0,
+      inMatter: Boolean(conversation.matterId),
+      recent: cleanHistory.map((m) => m.content),
+    });
+    console.log(`\x1b[35m[RetrievalGate]\x1b[0m 🧭 statutes=${gate.statutes ? "search" : "skip"}, documents=${gate.documents ? "search" : "skip"} (${gate.reason})`);
+    const ragResult = !gate.statutes
+      ? null
+      : await Promise.race([
+          retrieveLegalContext(userText).catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), config.upstreamTimeoutMs * 2)),
+        ]);
     if (ragResult) {
       console.log(
         `\x1b[32m[AgentRuntime]\x1b[0m 📚 Legal Vector RAG retrieved context (${ragResult.sources.length} sources, ${ragResult.contextText.length} chars)`
@@ -292,10 +328,12 @@ export async function sendMessage(
     }
 
     // 2. Passages of this user's documents (attached to this chat, or in its matter) that match the question
-    const documentHits: DocumentHit[] = await Promise.race([
-      searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null }, userText, 5).catch(() => [] as DocumentHit[]),
-      new Promise<DocumentHit[]>((resolve) => setTimeout(() => resolve([]), config.upstreamTimeoutMs)),
-    ]);
+    const documentHits: DocumentHit[] = !gate.documents
+      ? []
+      : await Promise.race([
+          searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null }, userText, 5).catch(() => [] as DocumentHit[]),
+          new Promise<DocumentHit[]>((resolve) => setTimeout(() => resolve([]), config.upstreamTimeoutMs)),
+        ]);
     const documentContext = buildDocumentContext(documentHits);
     let citations: Citation[] = [...documentContext.citations, ...statuteCitations(ragResult?.sources)];
 
@@ -332,6 +370,24 @@ export async function sendMessage(
       });
     }
 
+    if (imageParts.length > 0) {
+      sections.push({
+        id: "image-note",
+        text: `The user attached ${imageParts.length} image(s) (${imageNames.join(", ")}) to this message; you can see them. Read any text in an image exactly as written and say clearly when part of it is too small or unclear to read. Describe only what is visible, never guess at the rest, and treat what the image shows as the user's own material, not as verified law.`,
+        floorTokens: 60,
+        shedOrder: 95,
+      });
+    }
+
+    if (unreadableImages.length > 0) {
+      sections.push({
+        id: "images",
+        text: `The user attached image file(s) (${unreadableImages.join(", ")}) that this system cannot read. Do not describe or guess their contents. Tell the user plainly that image attachments are not readable yet and ask them to upload the document as a PDF or Word file, or paste the text, then answer anything else in their message.`,
+        floorTokens: 60,
+        shedOrder: 90,
+      });
+    }
+
     if (matter) {
       sections.push({
         id: "matter",
@@ -351,8 +407,13 @@ export async function sendMessage(
       });
     }
 
-    const fitted = fitPrompt({ sections, history: cleanHistory, userText, windowTokens: currentWindow(), answerTokens: config.answerMaxTokens });
-    const messages = fitted.messages;
+    // Each image takes a share of the window, so the text is fitted into what is left.
+    const imageReserve = imageParts.length * config.imageTokens;
+    const fitted = fitPrompt({ sections, history: cleanHistory, userText, windowTokens: Math.max(1024, currentWindow() - imageReserve), answerTokens: config.answerMaxTokens });
+    // The images travel with the user's message (the last one), which becomes text plus image parts.
+    const messages = (imageParts.length > 0
+      ? fitted.messages.map((m, i, all) => (i === all.length - 1 && m.role === "user" ? { ...m, content: [{ type: "text", text: m.content }, ...imageParts] } : m))
+      : fitted.messages) as typeof fitted.messages;
     console.log(
       `\x1b[34m[AgentRuntime]\x1b[0m 📏 Prompt ~${fitted.promptTokens} tokens of ${currentWindow()} (answer up to ${fitted.maxAnswerTokens}); ` +
         `${cleanHistory.length - fitted.droppedHistory}/${cleanHistory.length} chat messages kept${fitted.shortened.length ? `; shortened: ${fitted.shortened.join(", ")}` : ""}${fitted.userTextShortened ? "; user message shortened" : ""}`,
@@ -580,6 +641,7 @@ export async function sendMessage(
       createdAt: asstMsg.createdAt,
     });
     await touchConversation(conversationId, userId);
+    if (matterId) void noteMatterAnswered(matterId, userId, conversationId, asstMsg.text).catch(() => undefined);
 
     // After the answer is saved (so the user never waits for it): fold older messages into the chat's summary
     // once they no longer fit in the window.

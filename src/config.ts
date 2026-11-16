@@ -53,6 +53,13 @@ export const config = {
   contextWindowTokens: Number(process.env.CONTEXT_WINDOW_TOKENS || (ownLlm ? 8192 : 32768)),
   /** Most tokens one answer may use before it is continued in a second call. */
   answerMaxTokens: Number(process.env.ANSWER_MAX_TOKENS || (ownLlm ? 1500 : 1800)),
+  /**
+   * True when the model can look at images (the Lirava VL model on our own server). Attached PNG/JPEG/GIF files are
+   * then sent to it with the question. Set LLM_VISION=true or false to override; the default follows OWN_LLM.
+   */
+  visionEnabled: process.env.LLM_VISION ? process.env.LLM_VISION === "true" : ownLlm,
+  /** Window tokens held back for each image (a full-screen screenshot is about 1,100). */
+  imageTokens: Number(process.env.IMAGE_TOKENS || 1500),
 
   // Qdrant Vector Engine
   qdrantUrl: process.env.QDRANT_URL || "",

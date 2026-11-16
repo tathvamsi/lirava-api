@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 export interface MockLlm {
   url: string;
   /** Every chat request the service sent to the "model", newest last. */
-  requests: Array<{ system: string; user: string; maxTokens?: number; messages: Array<{ role: string; content: string }> }>;
+  requests: Array<{ system: string; user: string; maxTokens?: number; messages: Array<{ role: string; content: any }> }>;
   /** Makes the "server" refuse any prompt over this many tokens, like a real server with a small window. null = no limit. */
   setServerWindow(tokens: number | null): void;
   close(): Promise<void>;
@@ -28,13 +28,14 @@ export async function startMockLlm(): Promise<MockLlm> {
       let raw = "";
       req.on("data", (chunk) => (raw += chunk));
       req.on("end", () => {
-        const body = JSON.parse(raw) as { messages: Array<{ role: string; content: string }>; stream?: boolean; max_tokens?: number };
-        const system = body.messages.find((m) => m.role === "system")?.content ?? "";
-        const user = [...body.messages].reverse().find((m) => m.role === "user")?.content ?? "";
+        const body = JSON.parse(raw) as { messages: Array<{ role: string; content: any }>; stream?: boolean; max_tokens?: number };
+        const asText = (c: any): string => (typeof c === "string" ? c : Array.isArray(c) ? c.map((part: any) => (part.type === "text" ? part.text : "[image]")).join("") : "");
+        const system = asText(body.messages.find((m) => m.role === "system")?.content);
+        const user = asText([...body.messages].reverse().find((m) => m.role === "user")?.content);
         requests.push({ system, user, maxTokens: body.max_tokens, messages: body.messages });
 
         // A real server refuses a prompt that does not fit its window.
-        const promptTokens = Math.ceil(body.messages.reduce((n, m) => n + m.content.length, 0) / 3);
+        const promptTokens = Math.ceil(body.messages.reduce((n, m) => n + asText(m.content).length, 0) / 3);
         if (serverWindow !== null && promptTokens + (body.max_tokens ?? 0) > serverWindow) {
           res.statusCode = 400;
           res.setHeader("Content-Type", "application/json");
@@ -51,7 +52,7 @@ export async function startMockLlm(): Promise<MockLlm> {
           );
         }
         const isContinuation = user.startsWith("Continue exactly where you stopped");
-        const allText = body.messages.map((m) => m.content).join("\n");
+        const allText = body.messages.map((m) => asText(m.content)).join("\n");
         // "CUTOFF" in a question: the first answer stops early (finish_reason "length"); its continuation finishes.
         // "CUTOFF_FOREVER": every call stops early.
         const cutOff = allText.includes("CUTOFF") && (!isContinuation || allText.includes("CUTOFF_FOREVER"));

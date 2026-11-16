@@ -42,6 +42,27 @@ CREATE TABLE IF NOT EXISTS app_matters (
   updated_at  BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS app_matters_user_idx ON app_matters (user_id, updated_at DESC);
+ALTER TABLE app_matters ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'received';
+ALTER TABLE app_matters ADD COLUMN IF NOT EXISTS intake JSONB;
+ALTER TABLE app_matters ADD COLUMN IF NOT EXISTS handed_over_at BIGINT;
+
+-- What happened on a matter, newest last: stage changes, notes from counsel, approval checkpoints and finished work.
+CREATE TABLE IF NOT EXISTS app_matter_events (
+  id              TEXT PRIMARY KEY,
+  matter_id       TEXT NOT NULL,
+  user_id         TEXT NOT NULL,
+  type            TEXT NOT NULL,
+  stage           TEXT,
+  title           TEXT NOT NULL,
+  body            TEXT NOT NULL DEFAULT '',
+  conversation_id TEXT,
+  artifact_id     TEXT,
+  status          TEXT,
+  resolution_note TEXT,
+  created_at      BIGINT NOT NULL,
+  resolved_at     BIGINT
+);
+CREATE INDEX IF NOT EXISTS app_matter_events_matter_idx ON app_matter_events (matter_id, created_at);
 
 CREATE TABLE IF NOT EXISTS app_artifacts (
   id              TEXT PRIMARY KEY,
