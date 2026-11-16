@@ -123,7 +123,6 @@ export function fitPrompt(input: FitInput): FitResult {
   // 1. Shorten sections, least important first, only as far as needed.
   const byShed = [...sections].sort((a, b) => a.shedOrder - b.shedOrder);
   const history = input.minimal ? [] : [...input.history];
-  const historyTokens = () => history.reduce((n, m) => n + tokensOf(m.content), 0);
 
   // Recent chat messages are kept as far as the budget allows once the sections are settled, so shorten sections
   // only when even an empty history does not fit.

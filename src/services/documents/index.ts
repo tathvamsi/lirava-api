@@ -10,7 +10,7 @@ import { extractText } from "unpdf";
 import { getSql } from "../db/postgres.js";
 import { ensureEnglishTsv } from "../db/fts.js";
 import { withSchemaLock } from "../db/schema-lock.js";
-import { deleteFileForUser } from "../files/index.js";
+import { deleteFilesForUser } from "../files/index.js";
 
 export type IndexStatus = "ready" | "no_text" | "unsupported" | "failed";
 
@@ -359,5 +359,5 @@ export async function deleteChatOnlyDocuments(userId: string, conversationId: st
   const sql = await pg();
   const rows = await sql`
     DELETE FROM matter_documents WHERE user_id = ${userId} AND conversation_id = ${conversationId} AND matter_id IS NULL RETURNING id`;
-  for (const row of rows) await deleteFileForUser(row.id as string, userId);
+  await deleteFilesForUser(rows.map((row) => row.id as string), userId);
 }

@@ -124,6 +124,14 @@ export async function extractTextFromFile(fileId: string, userId: string): Promi
   return "";
 }
 
+/** Removes several files the user owns in one statement (instead of one delete per file). */
+export async function deleteFilesForUser(fileIds: string[], userId: string): Promise<number> {
+  if (!userId || fileIds.length === 0) return 0;
+  const sql = await pgData();
+  const rows = await sql`DELETE FROM app_files WHERE user_id = ${userId} AND id = ANY(${fileIds}) RETURNING id`;
+  return rows.length;
+}
+
 /** Removes a file the user owns. */
 export async function deleteFileForUser(fileId: string, userId: string): Promise<boolean> {
   if (!userId) return false;

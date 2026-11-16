@@ -31,7 +31,7 @@ import { decideRetrieval } from "./retrieval-gate.js";
 import { config } from "../../config.js";
 import { generateLegalResponse } from "../legal/knowledge.js";
 import { OFFLINE_NOTICE } from "../legal/notice.js";
-import { retrieveLegalContext, type RetrievedLegalContext } from "../legal/rag.js";
+import { retrieveLegalContext } from "../legal/rag.js";
 import { getAgentPersonaPrompt } from "./personas.js";
 import { routeLegalTask, type RoutingDecision } from "./router.js";
 import { extractTextFromFile, type Attachment } from "../files/index.js";
@@ -256,8 +256,12 @@ export async function sendMessage(
   if (attachments && attachments.length > 0) {
     for (const att of attachments) {
       if (indexed.get(att.id) === "ready") continue;
+      // An image has no text to extract, and its bytes are read once, later, if the model can see it.
+      if (isImageName(att.name)) {
+        imageFiles.push({ id: att.id, name: att.name });
+        continue;
+      }
       const extracted = await extractTextFromFile(att.id, userId);
-      if (!extracted.trim() && isImageName(att.name)) imageFiles.push({ id: att.id, name: att.name });
       if (extracted.trim()) {
         attachedDocumentContext += `\n\n[USER ATTACHED DOCUMENT: ${att.name}]\n${extracted.trim()}\n[END OF ATTACHED DOCUMENT]`;
       }
