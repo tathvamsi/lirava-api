@@ -25,33 +25,22 @@ import { requireAuth } from "./middleware/auth.js";
 import { pgData } from "./services/data/pg.js";
 import { runningFor } from "./services/agent/runtime.js";
 import { corsOrigin } from "./middleware/security.js";
-import { importLegacyChats, initChatStore } from "./services/chats/store.js";
+import { initChatStore } from "./services/chats/store.js";
 import { seedBuiltInProvisions } from "./services/legal/provisions.js";
 import { LEGAL_FOUNDATIONAL_CORPUS } from "./services/legal/corpus-seeder.js";
 import { getSql } from "./services/db/postgres.js";
 
 const app = new Hono();
 
-// Vakils, matters, documents and files live in PostgreSQL too: create the tables, add the built-in Vakils,
-// and copy over anything from the old local file (once).
+// Vakils, matters, documents and files live in PostgreSQL too: create the tables and add the built-in Vakils.
 if (config.nodeEnv !== "test") {
   pgData().catch((err) => console.error("[soli-backend] Data storage is unavailable:", err.message));
 }
 
-// Chats live in PostgreSQL. Create the tables, then copy over any chats from the old local file (once).
-initChatStore()
-  .then(() => importLegacyChats())
-  .then((result) => {
-    if (result) {
-      console.log(
-        `[soli-backend] Imported local chats into PostgreSQL: ${result.conversations} conversations, ${result.messages} messages` +
-          (result.skippedUnowned ? ` (${result.skippedUnowned} unowned conversations skipped)` : ""),
-      );
-    }
-  })
-  .catch((err) => {
-    console.error("[soli-backend] Chat storage is unavailable:", err.message);
-  });
+// Chats live in PostgreSQL. Create the tables.
+initChatStore().catch((err) => {
+  console.error("[soli-backend] Chat storage is unavailable:", err.message);
+});
 
 // The built-in starter provisions are also kept in PostgreSQL, so statute search works without the embedding server.
 if (config.nodeEnv !== "test") {

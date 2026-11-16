@@ -1,21 +1,12 @@
 process.env.NODE_ENV = "test";
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { after, before, describe, it } from "node:test";
 
-// An isolated local folder, so the import test never touches real data.
-const directory = mkdtempSync(path.join(tmpdir(), "lirava-admin-test-"));
-process.env.LEGACY_DATA_DIR = directory;
-
-// Loaded after the folder is set: static imports would run first and use the real ./.data folder.
 const { default: app } = await import("../src/index.js");
 const { createTestUser } = await import("./helpers.js");
-const { pgData, importLegacyData } = await import("../src/services/data/pg.js");
+const { pgData } = await import("../src/services/data/pg.js");
 const { logAuditEvent, listAuditLogs } = await import("../src/services/admin/audit-ledger.js");
-const { getLegacyDb, getDb } = await import("../src/services/db/index.js");
 import type { TestUser } from "./helpers.js";
 
 const RUN = Date.now();
@@ -67,42 +58,5 @@ describe("audit log", () => {
     assert.match(event.details, /\[REDACTED\]/);
     const sql = await pgData();
     await sql`DELETE FROM app_audit_events WHERE organization_id = ${org}`;
-  });
-});
-
-describe("importing the old local admin settings", () => {
-  after(async () => {
-    const sql = await pgData();
-    await sql`DELETE FROM app_models WHERE id = ${`model-old-${RUN}`}`;
-    await sql`DELETE FROM app_nodes WHERE id = ${`node-old-${RUN}`}`;
-    await sql`DELETE FROM app_api_keys WHERE id = ${`key-old-${RUN}`}`;
-    await sql`DELETE FROM app_plugins_installed WHERE user_id = ${`user-old-${RUN}`}`;
-    await sql`DELETE FROM app_connector_connections WHERE user_id = ${`user-old-${RUN}`}`;
-    getDb().close();
-    rmSync(directory, { recursive: true, force: true });
-  });
-
-  it("copies models, nodes, API keys, plugins and connector state once, keeping secrets as hashes", async () => {
-    const db = getDb();
-    const now = new Date().toISOString();
-    db.prepare("INSERT INTO admin_models (id, name, provider, gguf_file, quantization, context_window, disk_size_bytes, status, storage_path, temperature, top_p, created_at, updated_at) VALUES (?, 'Old model', 'llama.cpp', 'm.gguf', 'Q4', 4096, 10, 'ready', '/models/m.gguf', 0.2, 0.85, ?, ?)").run(`model-old-${RUN}`, now, now);
-    db.prepare("INSERT INTO admin_inference_nodes (id, name, address, last_heartbeat_at, created_at) VALUES (?, 'Old node', '10.0.0.1:8080', ?, ?)").run(`node-old-${RUN}`, now, now);
-    db.prepare("INSERT INTO admin_api_keys (id, organization_id, name, key_prefix, key_hash, scopes, created_at) VALUES (?, 'org-old', 'Old key', 'soli_live_ab', 'HASHONLY', 'chat', ?)").run(`key-old-${RUN}`, now);
-    db.prepare("INSERT INTO plugins_installed (id, user_id, plugin_id, version, installed_at) VALUES (?, ?, 'hearing-prep', '1.0.0', ?)").run(`plug-old-${RUN}`, `user-old-${RUN}`, Date.now());
-    db.prepare("INSERT INTO connector_connections (user_id, toolkit_slug, status, updated_at) VALUES (?, 'gmail', 'active', ?)").run(`user-old-${RUN}`, Date.now());
-    assert.ok(getLegacyDb(), "the old file is found");
-
-    await importLegacyData(true);
-    const sql = await pgData();
-    assert.equal((await sql`SELECT name FROM app_models WHERE id = ${`model-old-${RUN}`}`)[0].name, "Old model");
-    assert.equal((await sql`SELECT address FROM app_nodes WHERE id = ${`node-old-${RUN}`}`)[0].address, "10.0.0.1:8080");
-    assert.equal((await sql`SELECT key_hash FROM app_api_keys WHERE id = ${`key-old-${RUN}`}`)[0].key_hash, "HASHONLY");
-    assert.equal((await sql`SELECT COUNT(*)::int AS n FROM app_plugins_installed WHERE user_id = ${`user-old-${RUN}`}`)[0].n, 1);
-    assert.equal((await sql`SELECT status FROM app_connector_connections WHERE user_id = ${`user-old-${RUN}`}`)[0].status, "active");
-
-    // A second run changes nothing (existing rows are never overwritten).
-    await sql`UPDATE app_models SET name = 'Renamed in PostgreSQL' WHERE id = ${`model-old-${RUN}`}`;
-    await importLegacyData(true);
-    assert.equal((await sql`SELECT name FROM app_models WHERE id = ${`model-old-${RUN}`}`)[0].name, "Renamed in PostgreSQL");
   });
 });

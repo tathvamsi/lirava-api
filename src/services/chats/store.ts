@@ -7,7 +7,6 @@
  * session (see middleware/auth.ts), never from the request body or query.
  */
 import crypto from "node:crypto";
-import { getLegacyDb } from "../db/index.js";
 import { matterOwned, pgData } from "../data/pg.js";
 import { getSql } from "../db/postgres.js";
 import { emit } from "../bus/index.js";
@@ -447,58 +446,4 @@ export async function countConversations(): Promise<number> {
   const sql = await pg();
   const [row] = await sql`SELECT COUNT(*)::int AS n FROM chat_conversations`;
   return Number(row?.n ?? 0);
-}
-
-// ---------------- One-time import of the old local (SQLite) chats ----------------
-
-/**
- * Copies chats that were stored in the local SQLite file into Postgres, once.
- * Only conversations with a known owner are imported. Conversations with no
- * owner (`user_id = ''`) cannot be attributed to anyone, so they are skipped
- * rather than being made visible to every user. The SQLite data is left untouched.
- */
-export async function importLegacyChats(): Promise<{ conversations: number; messages: number; skippedUnowned: number } | null> {
-  const db = getLegacyDb();
-  if (!db) return null; // nothing local to import
-  const sql = await pg();
-  const done = await sql`SELECT 1 FROM app_settings WHERE key = 'chats_imported_to_postgres_v1'`.catch(() => []);
-  if (done.length) return null;
-  const convs = db.prepare("SELECT * FROM conversations").all() as Row[];
-  let conversations = 0;
-  let messages = 0;
-  let skippedUnowned = 0;
-
-  for (const c of convs) {
-    if (!c.user_id) {
-      skippedUnowned++;
-      continue;
-    }
-    const created = await sql`
-      INSERT INTO chat_conversations (id, user_id, vakil_id, matter_id, title, created_at, updated_at)
-      VALUES (${c.id}, ${c.user_id}, ${c.dot_id}, ${c.matter_id ?? null}, ${c.title ?? ""}, ${c.created_at}, ${c.updated_at || c.created_at})
-      ON CONFLICT (id) DO NOTHING RETURNING id`;
-    if (!created[0]) continue; // already there, possibly owned by someone else: leave it alone
-    conversations++;
-
-    const msgs = db.prepare("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at").all(c.id) as Row[];
-    for (const m of msgs) {
-      let attachments: unknown[] | null = null;
-      try {
-        const parsed = m.attachments ? JSON.parse(m.attachments) : null;
-        attachments = Array.isArray(parsed) && parsed.length ? parsed : null;
-      } catch {
-        attachments = null;
-      }
-      const ins = await sql`
-        INSERT INTO chat_messages (id, conversation_id, user_id, vakil_id, role, text, title, card, source, attachments, created_at)
-        VALUES (${m.id}, ${c.id}, ${c.user_id}, ${m.dot_id}, ${m.role === "dot" ? "vakil" : m.role}, ${m.text ?? ""}, ${m.title ?? null}, ${m.card ?? null},
-                ${m.source ?? null}, ${attachments ? sql.json(attachments as any) : null}, ${m.created_at})
-        ON CONFLICT (id) DO NOTHING RETURNING id`;
-      if (ins[0]) messages++;
-    }
-  }
-
-  await sql`INSERT INTO app_settings (key, value) VALUES ('chats_imported_to_postgres_v1', ${JSON.stringify({ at: Date.now(), conversations, messages, skippedUnowned })})
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
-  return { conversations, messages, skippedUnowned };
 }

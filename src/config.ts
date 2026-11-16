@@ -1,5 +1,4 @@
 import "dotenv/config";
-import path from "node:path";
 
 const nodeEnv = process.env.NODE_ENV || "development";
 export const isProduction = nodeEnv === "production";
@@ -29,8 +28,6 @@ export const config = {
   webUrl: (process.env.SOLI_WEB_URL || "http://localhost:3100").replace(/\/$/, ""),
   publicUrl: (process.env.SOLI_BACKEND_URL || "http://localhost:4000").replace(/\/$/, ""),
 
-  // Local data (SQLite file, uploaded files, vault)
-  legacyDataDir: path.resolve(process.cwd(), process.env.LEGACY_DATA_DIR || "./.data"),
   databaseUrl: process.env.DATABASE_URL || "",
 
   // Inference & LLM (OpenAI-compatible server)
