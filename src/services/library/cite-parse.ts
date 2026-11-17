@@ -31,6 +31,11 @@ const ACTS: Array<{ code: string; pattern: string }> = [
   { code: "IEA", pattern: "(?:Indian\\s+)?Evidence\\s+Act(?:,?\\s*1872)?|I\\.?\\s?E\\.?\\s?A\\.?" },
   { code: "NIA", pattern: "N\\.?\\s?I\\.?\\s+Act|Negotiable\\s+Instruments?\\s+Act(?:,?\\s*1881)?" },
   { code: "ICA", pattern: "Indian\\s+Contract\\s+Act(?:,?\\s*1872)?|Contract\\s+Act" },
+  { code: "NDPS", pattern: "NDPS(?:\\s+Act)?|Narcotic\\s+Drugs\\s+and\\s+Psychotropic\\s+Substances\\s+Act(?:,?\\s*1985)?" },
+  { code: "PMLA", pattern: "PMLA|Prevention\\s+of\\s+Money[\\s-]+Laundering\\s+Act(?:,?\\s*2002)?" },
+  { code: "POCSO", pattern: "POCSO(?:\\s+Act)?|Protection\\s+of\\s+Children\\s+from\\s+Sexual\\s+Offences\\s+Act(?:,?\\s*2012)?" },
+  { code: "PCA", pattern: "Prevention\\s+of\\s+Corruption\\s+Act(?:,?\\s*1988)?|P\\.?\\s?C\\.?\\s+Act" },
+  { code: "ITA", pattern: "Information\\s+Technology\\s+Act(?:,?\\s*2000)?|I\\.?\\s?T\\.?\\s+Act" },
 ];
 const ACT_GROUP = ACTS.map((a) => `(?:${a.pattern})`).join("|");
 

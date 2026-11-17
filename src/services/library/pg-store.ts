@@ -24,6 +24,27 @@ CREATE TABLE IF NOT EXISTS library_case_paras (
   text    TEXT NOT NULL,
   PRIMARY KEY (case_id, para_no)
 );
+
+-- Statute sections loaded from an official-text dataset, one row per section, with where each came from.
+CREATE TABLE IF NOT EXISTS library_provisions (
+  id               TEXT PRIMARY KEY,
+  act_code         TEXT NOT NULL,
+  section_num      TEXT NOT NULL,
+  act_title        TEXT NOT NULL,
+  year             INT,
+  act_status       TEXT NOT NULL,
+  in_force         BOOLEAN NOT NULL,
+  title            TEXT NOT NULL,
+  chapter          TEXT,
+  text             TEXT NOT NULL,
+  text_sha256      TEXT NOT NULL,
+  source_url       TEXT,
+  source_publisher TEXT,
+  dataset          TEXT NOT NULL,
+  licence          TEXT NOT NULL,
+  ingested_at      BIGINT NOT NULL,
+  UNIQUE (act_code, section_num)
+);
 `;
 
 const ACT_YEARS: Record<string, number> = { BNSS: 2023, BNS: 2023, BSA: 2023, IPC: 1860, CRPC: 1973, CPC: 1908, IEA: 1872, NIA: 1881, ICA: 1872 };
@@ -124,6 +145,19 @@ export class PgLibraryStore implements LibraryStore {
     const sql = getSql();
     if (!sql) return null;
     const code = actCode.toUpperCase();
+    // The loaded statute text comes first; the hand-written seed rows are the fallback for sections it does not hold.
+    try {
+      await ensureSchema();
+      const loaded = await sql<Array<{ id: string; act_code: string; section_num: string; title: string; source_url: string | null; act_status: string; text: string }>>`
+        SELECT id, act_code, section_num, title, source_url, act_status, text FROM library_provisions
+        WHERE act_code = ${code} AND section_num = ${sectionNum.toUpperCase()} LIMIT 1`;
+      if (loaded[0]) {
+        const r = loaded[0];
+        return { id: r.id, act_code: r.act_code, section_num: r.section_num, title: r.title, source: r.source_url, repealed: r.act_status === "repealed", text: r.text };
+      }
+    } catch {
+      /* fall through to the seed table */
+    }
     const candidates = ACT_YEARS[code] ? [code, `${code}_${ACT_YEARS[code]}`] : [code];
     const rows = await sql<Array<{ id: string; act_code: string; section_num: string; title: string; source: string | null }>>`
       SELECT id, act_code, section_num, title, source FROM legal_provisions
@@ -131,4 +165,43 @@ export class PgLibraryStore implements LibraryStore {
       LIMIT 1`;
     return rows[0] ?? null;
   }
+}
+
+export const ensureLibrarySchema = ensureSchema;
+
+export interface LibraryProvisionRow {
+  act_code: string;
+  section_num: string;
+  act_title: string;
+  year: number | null;
+  act_status: string;
+  in_force: boolean;
+  title: string;
+  chapter: string | null;
+  text: string;
+  text_sha256: string;
+  source_url: string | null;
+  source_publisher: string | null;
+  dataset: string;
+  licence: string;
+}
+
+/** Adds or refreshes statute sections. Returns how many rows were written. Re-running with the same data changes nothing. */
+export async function upsertLibraryProvisions(rows: LibraryProvisionRow[]): Promise<number> {
+  await ensureSchema();
+  const sql = getSql();
+  if (!sql) throw new Error("DATABASE_URL is not configured.");
+  const now = Date.now();
+  let written = 0;
+  for (let i = 0; i < rows.length; i += 200) {
+    const batch = rows.slice(i, i + 200).map((r) => ({ id: `${r.act_code}:${r.section_num}`, ...r, ingested_at: now }));
+    await sql`
+      INSERT INTO library_provisions ${sql(batch, "id", "act_code", "section_num", "act_title", "year", "act_status", "in_force", "title", "chapter", "text", "text_sha256", "source_url", "source_publisher", "dataset", "licence", "ingested_at")}
+      ON CONFLICT (id) DO UPDATE SET act_title = EXCLUDED.act_title, year = EXCLUDED.year, act_status = EXCLUDED.act_status,
+        in_force = EXCLUDED.in_force, title = EXCLUDED.title, chapter = EXCLUDED.chapter, text = EXCLUDED.text,
+        text_sha256 = EXCLUDED.text_sha256, source_url = EXCLUDED.source_url, source_publisher = EXCLUDED.source_publisher,
+        dataset = EXCLUDED.dataset, licence = EXCLUDED.licence, ingested_at = EXCLUDED.ingested_at`;
+    written += batch.length;
+  }
+  return written;
 }

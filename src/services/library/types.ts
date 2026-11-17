@@ -49,6 +49,10 @@ export interface LibraryProvision {
   section_num: string;
   title: string;
   source?: string | null;
+  /** The Act has been repealed (IPC, CrPC and the Evidence Act on 1 July 2024). It still governs offences committed before then. */
+  repealed?: boolean;
+  /** Full section text, when the library holds it. */
+  text?: string;
 }
 
 export interface LibraryStore {

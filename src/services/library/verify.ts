@@ -79,6 +79,7 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
       const d = options.offenceDate;
       if (d && NEW_CODES.has(cite.act_code) && d < NEW_CODES_IN_FORCE) warning = `The offence date (${d}) is before 1 July 2024, so the old law (IPC, CrPC or Evidence Act) applies, not ${cite.act_code}.`;
       if (d && OLD_CODES.has(cite.act_code) && d >= NEW_CODES_IN_FORCE) warning = `The offence date (${d}) is on or after 1 July 2024, so the new law (BNS, BNSS or BSA) applies, not ${cite.act_code}.`;
+      if (!warning && provision?.repealed) warning = `${cite.act_code} was repealed on 1 July 2024. It still governs offences committed before that date; for later offences the new law applies.`;
       verdicts.push(
         provision
           ? { ...base, status: "verified", reason: "ok", level: "citation", library_id: provision.id, library_title: provision.title, source_url: provision.source ?? null, ...(warning ? { warning } : {}) }

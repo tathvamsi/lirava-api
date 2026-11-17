@@ -37,6 +37,12 @@ describe("citation parser", () => {
     ["Order XXXIX Rule 1 CPC", ["CPC:O39_R1"]],
     ["Order 39 Rule 1 of the Code of Civil Procedure", ["CPC:O39_R1"]],
     ["Section 65B of the Evidence Act", ["IEA:65B"]],
+    ["Section 3 of the PMLA", ["PMLA:3"]],
+    ["Section 20 NDPS Act", ["NDPS:20"]],
+    ["Section 4 of the Protection of Children from Sexual Offences Act, 2012", ["POCSO:4"]],
+    ["Section 13 of the Prevention of Corruption Act, 1988", ["PCA:13"]],
+    ["Section 66C of the Information Technology Act, 2000", ["ITA:66C"]],
+    ["Section 43 IT Act", ["ITA:43"]],
   ];
   for (const [input, expected] of table) {
     it(`reads "${input}"`, () => assert.deepEqual(keysOf(input), expected));
@@ -81,7 +87,8 @@ describe("verifying citations against the library", () => {
     .addCase({ id: "dup-a", title: "Alpha v. Beta", court: "HC", year: 2001, citation_text: "(2001) 1 SCC 1" }, ["(2001) 1 SCC 1"])
     .addCase({ id: "dup-b", title: "Gamma v. Delta", court: "HC", year: 2001, citation_text: "(2001) 1 SCC 1" }, ["(2001) 1 SCC 1"])
     .addProvision({ id: "nia-138", act_code: "NIA", section_num: "138", title: "Dishonour of cheque for insufficiency of funds" })
-    .addProvision({ id: "bns-103", act_code: "BNS", section_num: "103", title: "Punishment for murder" });
+    .addProvision({ id: "bns-103", act_code: "BNS", section_num: "103", title: "Punishment for murder" })
+    .addProvision({ id: "ipc-302", act_code: "IPC", section_num: "302", title: "Punishment for murder", repealed: true });
 
   const only = async (text: string, offenceDate?: string) => {
     const r = await verifyAnswer(text, store, { offenceDate });
@@ -213,6 +220,14 @@ describe("verifying citations against the library", () => {
       ["verified", "Punishment for murder"],
       ["unverified", undefined],
     ]);
+  });
+
+  it("says a repealed Act was repealed, and that it still governs older offences", async () => {
+    const [v] = await only("Section 302 IPC provides the punishment.");
+    assert.equal(v.status, "verified");
+    assert.match(v.warning ?? "", /repealed on 1 July 2024.*before that date/);
+    const [dated] = await only("Section 302 IPC provides the punishment.", "2022-01-01");
+    assert.equal(dated.warning?.includes("repealed"), true, "an old offence still gets the repeal note");
   });
 
   it("warns when the new codes are cited for an offence before 1 July 2024", async () => {
