@@ -11,6 +11,7 @@ import { getSql } from "../db/postgres.js";
 import { ensureEnglishTsv } from "../db/fts.js";
 import { withSchemaLock } from "../db/schema-lock.js";
 import { deleteFilesForUser } from "../files/index.js";
+import { ocrEnabled, ocrFile } from "./ocr.js";
 
 export type IndexStatus = "ready" | "no_text" | "unsupported" | "failed";
 
@@ -134,17 +135,84 @@ async function docxParagraphs(buffer: Buffer): Promise<string[]> {
     .filter(Boolean);
 }
 
-/** The text of a file, one entry per page (or per section for formats without pages). */
+/** What OCR did for a file, so the lawyer can be told the text came from a scan. */
+export interface OcrSummary {
+  /** Pages whose text came from OCR. */
+  pages: number;
+  /** Pages OCR could not read well enough to trust; their text was left out. */
+  unclear: number;
+  /** Mean confidence of the pages that were kept, 0 to 100. */
+  confidence: number;
+  truncated: boolean;
+  lang: string;
+}
+
+/** A page with fewer characters than this has no usable text layer (a scan, or a blank page). */
+const EMPTY_PAGE_CHARS = 25;
+/** OCR pages below this confidence are noise, and are not stored. */
+const MIN_OCR_CONFIDENCE = 35;
+const IMAGE_EXT = /\.(png|jpe?g|webp|tiff?)$/;
+
+/**
+ * Runs OCR and keeps only pages it can read. `wanted` lists the (zero-based) pages that need it; others are ignored.
+ * Returns null when OCR is off or fails, so the caller falls back to "no readable text".
+ */
+async function readWithOcr(buffer: Buffer, wanted: number[]): Promise<{ texts: Map<number, string>; summary: OcrSummary } | null> {
+  if (!ocrEnabled()) return null;
+  try {
+    const result = await ocrFile(buffer);
+    const texts = new Map<number, string>();
+    let unclear = 0;
+    let confidenceSum = 0;
+    for (const page of result.pages) {
+      const index = page.page - 1;
+      if (!wanted.includes(index)) continue;
+      if (page.text.trim().length < EMPTY_PAGE_CHARS) continue; // truly blank, not "unclear"
+      if (page.confidence < MIN_OCR_CONFIDENCE) {
+        unclear++;
+        continue;
+      }
+      texts.set(index, page.text);
+      confidenceSum += page.confidence;
+    }
+    return {
+      texts,
+      summary: { pages: texts.size, unclear, confidence: texts.size ? Math.round(confidenceSum / texts.size) : 0, truncated: result.truncated, lang: result.lang },
+    };
+  } catch (err) {
+    console.warn("[documents] OCR failed:", (err as Error).message);
+    return null;
+  }
+}
+
+/**
+ * The text of a file, one entry per page (or per section for formats without pages).
+ * With `ocr: true`, scanned pages and photos are read by the OCR service; the result then says so in `ocr`.
+ */
 export async function extractPages(
   name: string,
   mime: string,
   buffer: Buffer,
-): Promise<{ pages: string[]; unit: "page" | "section" } | { unsupported: true }> {
+  options: { ocr?: boolean } = {},
+): Promise<{ pages: string[]; unit: "page" | "section"; ocr?: OcrSummary } | { unsupported: true }> {
   const lower = name.toLowerCase();
   if (mime.includes("pdf") || lower.endsWith(".pdf")) {
     const result = await extractText(new Uint8Array(buffer), { mergePages: false });
-    const pages = Array.isArray(result.text) ? result.text : [String(result.text ?? "")];
-    return { pages: pages.slice(0, MAX_PAGES), unit: "page" };
+    const pages = (Array.isArray(result.text) ? result.text : [String(result.text ?? "")]).slice(0, MAX_PAGES);
+    const empty = pages.flatMap((text, index) => (text.trim().length < EMPTY_PAGE_CHARS ? [index] : []));
+    // OCR only when a real share of the pages has no text layer, so a text PDF with one blank page is not sent away.
+    if (options.ocr && empty.length > 0 && empty.length / pages.length >= 0.25) {
+      const read = await readWithOcr(buffer, empty);
+      if (read) {
+        read.texts.forEach((text, index) => (pages[index] = text));
+        return { pages, unit: "page", ocr: read.summary };
+      }
+    }
+    return { pages, unit: "page" };
+  }
+  if (options.ocr && ocrEnabled() && IMAGE_EXT.test(lower)) {
+    const read = await readWithOcr(buffer, [0]);
+    return { pages: [read?.texts.get(0) ?? ""], unit: "page", ...(read ? { ocr: read.summary } : {}) };
   }
   if (lower.endsWith(".docx")) {
     return { pages: toSections(await docxParagraphs(buffer)).slice(0, MAX_PAGES), unit: "section" };
@@ -181,6 +249,14 @@ export function chunkText(text: string, size = CHUNK_CHARS, overlap = CHUNK_OVER
 
 // ---------------- Indexing ----------------
 
+/** Tells the lawyer the text came from a scan, so names, dates and amounts get checked against the original. */
+function ocrNote(ocr: OcrSummary): string {
+  const parts = [`Read from a scan (OCR, ${ocr.pages} page${ocr.pages === 1 ? "" : "s"}, ${ocr.confidence}% average confidence). Check names, dates and amounts against the original.`];
+  if (ocr.unclear) parts.push(`${ocr.unclear} page${ocr.unclear === 1 ? " was" : "s were"} too unclear to read and left out.`);
+  if (ocr.truncated) parts.push("Only the first 40 pages were read.");
+  return parts.join(" ");
+}
+
 export async function indexDocument(input: {
   userId: string;
   fileId: string;
@@ -196,7 +272,7 @@ export async function indexDocument(input: {
   const rows: Array<{ document_id: string; user_id: string; page: number; idx: number; text: string }> = [];
 
   try {
-    const extracted = await extractPages(input.name, input.mime, input.buffer);
+    const extracted = await extractPages(input.name, input.mime, input.buffer, { ocr: true });
     if ("unsupported" in extracted) {
       result = { status: "unsupported", pages: 0, chunks: 0, unit: "page", note: "This file type is stored but its text is not searchable." };
     } else {
@@ -214,7 +290,7 @@ export async function indexDocument(input: {
               unit: extracted.unit,
               note: "No readable text was found. A scanned document needs OCR before it can be searched.",
             }
-          : { status: "ready", pages: extracted.pages.length, chunks: rows.length, unit: extracted.unit };
+          : { status: "ready", pages: extracted.pages.length, chunks: rows.length, unit: extracted.unit, ...(extracted.ocr ? { note: ocrNote(extracted.ocr) } : {}) };
     }
   } catch (err) {
     console.warn("[documents] could not read", input.name, (err as Error).message);

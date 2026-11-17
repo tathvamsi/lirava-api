@@ -7,6 +7,7 @@ import {
   resolveMatterCheckpoint,
   type MatterIntake,
 } from "../services/repo/index.js";
+import { advanceCaseFile, getCaseFile } from "../services/casefile/index.js";
 import { requireAuth, type AuthEnv } from "../middleware/auth.js";
 
 export const mattersRoutes = new Hono<AuthEnv>();
@@ -66,6 +67,30 @@ mattersRoutes.get("/:id", async (c) => {
   const matter = await getMatterForUser(c.req.param("id"), userId);
   if (!matter) return c.json({ error: "Matter not found." }, 404);
   return c.json({ matter, events: await listMatterEvents(matter.id, userId) });
+});
+
+/** The case file built from this matter's documents (null until a build has been started). */
+mattersRoutes.get("/:id/case-file", async (c) => {
+  const userId = c.get("user").id;
+  const matter = await getMatterForUser(c.req.param("id"), userId);
+  if (!matter) return c.json({ error: "Matter not found." }, 404);
+  return c.json({ caseFile: await getCaseFile(userId, matter.id) });
+});
+
+/**
+ * Starts building the case file, or carries on with a build in progress. Each call works for a short while and
+ * returns; call again while the status is "building". `restart: true` throws away a finished one and reads again.
+ */
+mattersRoutes.post("/:id/case-file/build", async (c) => {
+  const userId = c.get("user").id;
+  const matter = await getMatterForUser(c.req.param("id"), userId);
+  if (!matter) return c.json({ error: "Matter not found." }, 404);
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  try {
+    return c.json({ caseFile: await advanceCaseFile(userId, matter.id, { restart: body?.restart === true }) });
+  } catch {
+    return c.json({ error: "The case file could not be built. Try again." }, 502);
+  }
 });
 
 mattersRoutes.post("/:id/checkpoints/:eventId", async (c) => {

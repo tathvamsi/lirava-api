@@ -58,6 +58,14 @@ export const config = {
   /** Window tokens held back for each image (a full-screen screenshot is about 1,100). */
   imageTokens: Number(process.env.IMAGE_TOKENS || 1500),
 
+  /**
+   * OCR service (Tesseract on our own server) that reads scanned PDFs and photos. Leave OCR_BASE_URL empty to turn it off:
+   * scanned documents are then reported as unreadable, as before. OCR_LANG is "auto" or codes such as "eng+hin".
+   */
+  ocrBaseUrl: (process.env.OCR_BASE_URL || "").replace(/\/$/, ""),
+  ocrApiKey: process.env.OCR_API_KEY || "",
+  ocrLang: process.env.OCR_LANG || "auto",
+
   // Qdrant Vector Engine
   qdrantUrl: process.env.QDRANT_URL || "",
   qdrantApiKey: process.env.QDRANT_API_KEY || "",
