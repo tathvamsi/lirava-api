@@ -238,3 +238,63 @@ describe("verifying citations against the library", () => {
     assert.equal(none.warning, undefined);
   });
 });
+
+describe("Supreme Court Reports and neutral citations, as the Court prints them", () => {
+  const parse: Array<[string, string[]]> = [
+    ["[2023] 16 S.C.R. 872", ["SCR:2023:16:872"]],
+    ["[2023] 16 SCR 872", ["SCR:2023:16:872"]],
+    ["[1951] SUPP. 1 S.C.R. 5", ["SCR:1951:S1:5"]],
+    ["[1950] 1 S.C.R. 15", ["SCR:1950:1:15"]],
+    ["2023 INSC 1043", ["INSC:2023:1043"]],
+    ["(2014) 8 Scale 250", ["SCALE:2014:8:250"]],
+    ["(2014) 8 S.C.A.L.E. 250", ["SCALE:2014:8:250"]],
+  ];
+  for (const [text, want] of parse) {
+    it(`reads ${text}`, () => assert.deepEqual(keysOf(text), want));
+  }
+
+  it("finds both citations of one judgment from a single stored string", () => {
+    assert.deepEqual(keysFromCitationString("[2023] 16 S.C.R. 872; 2023 INSC 1043").sort(), ["INSC:2023:1043", "SCR:2023:16:872"]);
+  });
+
+  // Two real records from the Court's own metadata.
+  const store = new MemoryLibraryStore()
+    .addCase(
+      { id: "scj:2023_16_872_887", title: "ELDECO HOUSING AND INDUSTRIES LIMITED v. ASHOK VIDYARTHI AND OTHERS", court: "Supreme Court of India", year: 2023, citation_text: "[2023] 16 S.C.R. 872; 2023 INSC 1043", source_url: null },
+      ["[2023] 16 S.C.R. 872", "2023 INSC 1043"],
+    )
+    .addCase(
+      { id: "scj:2023_15_808_820", title: "RAM LAL v. STATE OF RAJASTHAN & ORS.", court: "Supreme Court of India", year: 2023, citation_text: "[2023] 15 S.C.R. 808; 2023 INSC 1047", source_url: null },
+      ["[2023] 15 S.C.R. 808", "2023 INSC 1047"],
+    );
+  const check = async (text: string) => (await verifyAnswer(text, store)).verdicts;
+
+  it("verifies a neutral citation with the right case name", async () => {
+    const [v] = await check("See Eldeco Housing and Industries Ltd v. Ashok Vidyarthi, 2023 INSC 1043.");
+    assert.equal(v.status, "verified");
+    assert.equal(v.level, "citation");
+  });
+
+  it("verifies the same case by its SCR citation", async () => {
+    const [v] = await check("Eldeco Housing v. Ashok Vidyarthi [2023] 16 S.C.R. 872 is on point.");
+    assert.equal(v.status, "verified");
+  });
+
+  it("flags a real neutral citation given to the wrong case", async () => {
+    const [v] = await check("In Eldeco Housing v. Ashok Vidyarthi, 2023 INSC 1047, the Court held so.");
+    assert.equal(v.status, "partial");
+    assert.equal(v.reason, "title_mismatch");
+  });
+
+  it("does not verify a neutral number the library does not hold", async () => {
+    const [v] = await check("Eldeco Housing v. Ashok Vidyarthi, 2023 INSC 99999.");
+    assert.equal(v.status, "unverified");
+    assert.equal(v.reason, "not_in_library");
+  });
+
+  it("does not verify a quotation, because no judgment text is held", async () => {
+    const [v] = await check('Eldeco Housing v. Ashok Vidyarthi, 2023 INSC 1043: "the allottee is entitled to interest from the date of possession".');
+    assert.notEqual(v.status, "verified", "a quote cannot be confirmed without text");
+    assert.equal(v.reason, "no_text");
+  });
+});

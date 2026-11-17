@@ -98,9 +98,16 @@ export function extractCitations(text: string): ParsedCite[] {
     while ((m = re.exec(text))) reporter("SCC", m[1], `S${m[2]}`, m[3], m, out);
   }
   // SCR / SCALE: "[2014] 3 SCR 45", "(2014) 5 SCALE 12"
-  for (const series of ["SCR", "SCALE"]) {
-    const re = new RegExp(`[\\(\\[]\\s*(${YEAR})\\s*[\\)\\]]\\s*(\\d{1,3})\\s+${series}\\s+(\\d{1,5})\\b`, "g");
+  // The Court's own form is "[2023] 16 S.C.R. 872" and, for supplementary volumes, "[1951] SUPP. 1 S.C.R. 5".
+  const SERIES: Array<[string, string, string]> = [
+    ["SCR", "S\\.?\\s?C\\.?\\s?R\\.?", "g"],
+    ["SCALE", "S\\.?\\s?C\\.?\\s?A\\.?\\s?L\\.?\\s?E\\.?", "gi"],
+  ];
+  for (const [series, pattern, flags] of SERIES) {
+    const re = new RegExp(`[\\(\\[]\\s*(${YEAR})\\s*[\\)\\]]\\s*(\\d{1,3})\\s+${pattern}\\s+(\\d{1,5})\\b`, flags);
     while ((m = re.exec(text))) reporter(series, m[1], m[2], m[3], m, out);
+    const supp = new RegExp(`[\\(\\[]\\s*(${YEAR})\\s*[\\)\\]]\\s*Supp\\.?\\s*\\(?\\s*(\\d{1,3})\\s*\\)?\\s+${pattern}\\s+(\\d{1,5})\\b`, "gi");
+    while ((m = supp.exec(text))) reporter(series, m[1], `S${m[2]}`, m[3], m, out);
   }
   // AIR: "AIR 2008 SC 123", "A.I.R. 2008 S.C. 123", "AIR 2008 Del 55". Upper-case AIR only, so the word "air" never matches.
   {

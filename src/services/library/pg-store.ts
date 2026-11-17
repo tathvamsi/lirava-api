@@ -25,6 +25,28 @@ CREATE TABLE IF NOT EXISTS library_case_paras (
   PRIMARY KEY (case_id, para_no)
 );
 
+-- Reported judgments known by name, date, bench and citation. No judgment text lives here: this is the list a
+-- citation is checked against, kept apart from legal_cases so that retrieval never returns a case with no text.
+CREATE TABLE IF NOT EXISTS library_judgments (
+  id               TEXT PRIMARY KEY,
+  title            TEXT NOT NULL,
+  petitioner       TEXT,
+  respondent       TEXT,
+  court            TEXT NOT NULL,
+  year             INT  NOT NULL,
+  decision_date    TEXT,
+  bench            TEXT,
+  disposal         TEXT,
+  neutral_citation TEXT,
+  scr_citation     TEXT,
+  cnr              TEXT,
+  pdf_path         TEXT,
+  dataset          TEXT NOT NULL,
+  licence          TEXT NOT NULL,
+  ingested_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS library_judgments_year_idx ON library_judgments (year);
+
 -- Statute sections loaded from an official-text dataset, one row per section, with where each came from.
 CREATE TABLE IF NOT EXISTS library_provisions (
   id               TEXT PRIMARY KEY,
@@ -110,6 +132,26 @@ const toCase = (r: CaseRow): LibraryCase => ({
   para_count: Number(r.para_count),
 });
 
+interface JudgmentRow {
+  id: string;
+  title: string;
+  court: string;
+  year: number;
+  neutral_citation: string | null;
+  scr_citation: string | null;
+}
+
+// No paragraphs are stored for these, so the verifier can confirm the citation and the case name but not a quotation.
+const toJudgmentCase = (r: JudgmentRow): LibraryCase => ({
+  id: r.id,
+  title: r.title,
+  court: r.court,
+  year: r.year,
+  citation_text: [r.scr_citation, r.neutral_citation].filter(Boolean).join("; "),
+  source_url: null,
+  para_count: 0,
+});
+
 export class PgLibraryStore implements LibraryStore {
   async findCases(key: string): Promise<LibraryCase[]> {
     await ensureSchema();
@@ -120,7 +162,11 @@ export class PgLibraryStore implements LibraryStore {
              (SELECT COUNT(*) FROM library_case_paras p WHERE p.case_id = c.id) AS para_count
       FROM library_cite_keys k JOIN legal_cases c ON c.id = k.case_id
       WHERE k.key = ${key}`;
-    return rows.map(toCase);
+    const judgments = await sql<JudgmentRow[]>`
+      SELECT j.id, j.title, j.court, j.year, j.neutral_citation, j.scr_citation
+      FROM library_cite_keys k JOIN library_judgments j ON j.id = k.case_id
+      WHERE k.key = ${key}`;
+    return [...rows.map(toCase), ...judgments.map(toJudgmentCase)];
   }
 
   async getCase(id: string): Promise<LibraryCase | null> {
@@ -131,7 +177,10 @@ export class PgLibraryStore implements LibraryStore {
       SELECT c.id, c.case_title, c.primary_citation, c.court, c.year,
              (SELECT COUNT(*) FROM library_case_paras p WHERE p.case_id = c.id) AS para_count
       FROM legal_cases c WHERE c.id = ${id}`;
-    return rows[0] ? toCase(rows[0]) : null;
+    if (rows[0]) return toCase(rows[0]);
+    const judgments = await sql<JudgmentRow[]>`
+      SELECT id, title, court, year, neutral_citation, scr_citation FROM library_judgments WHERE id = ${id}`;
+    return judgments[0] ? toJudgmentCase(judgments[0]) : null;
   }
 
   async getParas(caseId: string): Promise<CasePara[]> {
@@ -184,6 +233,54 @@ export interface LibraryProvisionRow {
   source_publisher: string | null;
   dataset: string;
   licence: string;
+}
+
+export interface LibraryJudgmentRow {
+  id: string;
+  title: string;
+  petitioner: string | null;
+  respondent: string | null;
+  court: string;
+  year: number;
+  decision_date: string | null;
+  bench: string | null;
+  disposal: string | null;
+  neutral_citation: string | null;
+  scr_citation: string | null;
+  cnr: string | null;
+  pdf_path: string | null;
+  dataset: string;
+  licence: string;
+}
+
+/** Adds or refreshes reported judgments and every citation key they can be found by. Re-running changes nothing. */
+export async function upsertLibraryJudgments(rows: LibraryJudgmentRow[]): Promise<{ judgments: number; keys: number }> {
+  await ensureSchema();
+  const sql = getSql();
+  if (!sql) throw new Error("DATABASE_URL is not configured.");
+  const now = Date.now();
+  let judgments = 0;
+  let keys = 0;
+  for (let i = 0; i < rows.length; i += 500) {
+    const slice = rows.slice(i, i + 500);
+    const batch = slice.map((r) => ({ ...r, ingested_at: now }));
+    await sql`
+      INSERT INTO library_judgments ${sql(batch, "id", "title", "petitioner", "respondent", "court", "year", "decision_date", "bench", "disposal", "neutral_citation", "scr_citation", "cnr", "pdf_path", "dataset", "licence", "ingested_at")}
+      ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, petitioner = EXCLUDED.petitioner, respondent = EXCLUDED.respondent,
+        court = EXCLUDED.court, year = EXCLUDED.year, decision_date = EXCLUDED.decision_date, bench = EXCLUDED.bench,
+        disposal = EXCLUDED.disposal, neutral_citation = EXCLUDED.neutral_citation, scr_citation = EXCLUDED.scr_citation,
+        cnr = EXCLUDED.cnr, pdf_path = EXCLUDED.pdf_path, dataset = EXCLUDED.dataset, licence = EXCLUDED.licence,
+        ingested_at = EXCLUDED.ingested_at`;
+    judgments += batch.length;
+    const keyRows = slice.flatMap((r) =>
+      [...new Set([r.neutral_citation, r.scr_citation].flatMap((c) => (c ? keysFromCitationString(c) : [])))].map((key) => ({ key, case_id: r.id })),
+    );
+    if (keyRows.length) {
+      await sql`INSERT INTO library_cite_keys ${sql(keyRows, "key", "case_id")} ON CONFLICT DO NOTHING`;
+      keys += keyRows.length;
+    }
+  }
+  return { judgments, keys };
 }
 
 /** Adds or refreshes statute sections. Returns how many rows were written. Re-running with the same data changes nothing. */
