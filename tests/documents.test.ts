@@ -10,6 +10,10 @@ import { createMatter } from "../src/services/repo/index.js";
 import { chunkText, indexDocument, linkDocuments, listMatterDocuments, searchDocuments, searchTerms } from "../src/services/documents/index.js";
 import { buildDocumentContext } from "../src/services/documents/context.js";
 import { generateDocumentDocx } from "../src/services/legal/documents.js";
+import { config } from "../src/config.js";
+
+// These tests are about files read without OCR. A developer's .env may switch OCR on, so it is off here.
+config.ocrBaseUrl = "";
 
 async function makePdf(pages: string[]): Promise<Buffer> {
   const pdf = await PDFDocument.create();

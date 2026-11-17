@@ -2,6 +2,8 @@ import { getLlmClient } from "./client.js";
 import { getMatterForUser, noteMatterAnswered, noteMatterWorkStarted } from "../repo/index.js";
 import { emit } from "../bus/index.js";
 import { buildDocumentContext, statuteCitations } from "../documents/context.js";
+import { PgLibraryStore } from "../library/pg-store.js";
+import { verifyAnswer } from "../library/verify.js";
 import { indexedStatus, linkDocuments, searchDocuments, type DocumentHit } from "../documents/index.js";
 import {
   ChatError,
@@ -644,6 +646,19 @@ export async function sendMessage(
     }
 
     asstMsg.text = assistantText;
+
+    // Check every case and section the answer names against the legal library. Nothing the model typed is trusted:
+    // a citation is "verified" only when it matches a library record. The result travels beside the answer as its own
+    // event (not mixed into `citations`), and a failed or slow check never holds the answer back.
+    try {
+      const check = await withTimeout(verifyAnswer(assistantText, new PgLibraryStore()).catch(() => null), config.upstreamTimeoutMs, null);
+      if (check && check.verdicts.length > 0) {
+        console.log(`\x1b[35m[CitationCheck]\x1b[0m ⚖️ ${check.counts.verified} verified, ${check.counts.partial} partly, ${check.counts.unverified} not in the library`);
+        emit({ type: "citation_check", vakilId, userId, data: { messageId: asstMsg.id, ...check } });
+      }
+    } catch {
+      /* the check is advisory */
+    }
 
     await insertMessage({
       id: asstMsg.id,
