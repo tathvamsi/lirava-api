@@ -1,3 +1,4 @@
+import { extractIndicStatutes, normalizeIndic } from "./cite-indic.js";
 import type { ParsedCite } from "./types.js";
 
 /**
@@ -66,7 +67,9 @@ function reporter(series: string, year: string, vol: string, page: string, m: Re
   });
 }
 
-export function extractCitations(text: string): ParsedCite[] {
+export function extractCitations(input: string): ParsedCite[] {
+  // Digits of Indian scripts become 0-9 first. Each is one character for one character, so spans still point into `input`.
+  const text = normalizeIndic(input);
   const out: ParsedCite[] = [];
   let m: RegExpExecArray | null;
 
@@ -151,6 +154,15 @@ export function extractCitations(text: string): ParsedCite[] {
     }
   }
 
+  // Statutes written in Hindi, Marathi, Kannada, Tamil or Telugu ("धारा 302 भारतीय दंड संहिता", "ಕಲಂ 302 ಐಪಿಸಿ").
+  {
+    const already = out.filter((o) => o.kind === "statute");
+    // Every section in a list shares the span of the whole phrase, so overlap is judged against what was found before this step.
+    for (const c of extractIndicStatutes(text, ACT_GROUP, actCodeOf)) {
+      if (!already.some((o) => c.span[0] < o.span[1] && o.span[0] < c.span[1])) out.push(c);
+    }
+  }
+
   // Paragraph pointers: "para 23", "paras 23-25", "¶ 12"
   {
     const re = /\b(?:paras?\.?|paragraphs?)\s*(\d{1,3}(?:\s*(?:-|–|to)\s*\d{1,3})?)|¶\s*(\d{1,3})/gi;
@@ -160,7 +172,8 @@ export function extractCitations(text: string): ParsedCite[] {
     }
   }
 
-  return out.sort((a, b) => a.span[0] - b.span[0] || a.span[1] - b.span[1]);
+  // `raw` quotes what was written, native digits and all (normalizing kept every offset, so the spans still fit).
+  return out.map((c) => ({ ...c, raw: input.slice(c.span[0], c.span[1]) })).sort((a, b) => a.span[0] - b.span[0] || a.span[1] - b.span[1]);
 }
 
 /** The key a citation is stored and looked up under. Two writings of the same citation give the same key. */

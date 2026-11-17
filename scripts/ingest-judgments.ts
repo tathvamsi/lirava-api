@@ -43,6 +43,7 @@ function load(): LibraryJudgmentRow[] {
         scr_citation: r.scr_citation || null,
         cnr: r.cnr || null,
         pdf_path: r.pdf_path || null,
+        languages: Array.isArray(r.languages) && r.languages.length ? r.languages.join(",") : null,
         dataset: r.dataset,
         licence: r.licence,
       });

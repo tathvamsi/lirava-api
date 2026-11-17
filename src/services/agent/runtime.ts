@@ -39,6 +39,8 @@ import { extractTextFromFile, type Attachment } from "../files/index.js";
 import { isImageName, loadImageParts, type ImagePart } from "./vision.js";
 import crypto from "node:crypto";
 import { RunQueue } from "./queue.js";
+import { languageSection } from "./language.js";
+import { getPreferences } from "../preferences/index.js";
 
 /** The promise's value, or `fallback` if it takes longer than `ms`. The timer is cleared either way. */
 function withTimeout<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -414,6 +416,10 @@ export async function sendMessage(
         shedOrder: 30,
       });
     }
+
+    // Which language documents are written in: the user's saved default, or the rule to ask first (see language.ts).
+    const savedLanguage = await withTimeout(getPreferences(userId).then((p) => p.documentLanguage).catch(() => undefined), 1500, undefined);
+    sections.push({ id: "language", text: languageSection(savedLanguage), floorTokens: 120, shedOrder: 96 });
 
     if (chatSummary) {
       sections.push({

@@ -22,6 +22,9 @@ const NEW_CODES_IN_FORCE = "2024-07-01";
 const NEW_CODES = new Set(["BNS", "BNSS", "BSA"]);
 const OLD_CODES = new Set(["IPC", "CRPC", "IEA"]);
 
+/** Letters of the Indian scripts the product supports: Devanagari, Bengali, Gurmukhi, Gujarati, Odia, Tamil, Telugu, Kannada, Malayalam. */
+const INDIC_LETTERS = /[ऀ-ൿ]/;
+
 const STOP = new Set(["state", "union", "india", "another", "others", "anr", "ors", "versus", "of", "the", "and", "through", "its", "secretary", "ltd", "limited", "pvt", "private", "company", "government", "govt", "from", "with", "under"]);
 
 const tokens = (s: string) =>
@@ -99,7 +102,8 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
     }
 
     const record = matches[0];
-    const found = { ...base, library_id: record.id, library_citation: record.citation_text, library_title: record.title, source_url: record.source_url ?? null } as const;
+    const translations = (record.languages ?? []).filter((l) => l !== "ENG");
+    const found = { ...base, library_id: record.id, library_citation: record.citation_text, library_title: record.title, source_url: record.source_url ?? null, ...(translations.length ? { translations } : {}) } as const;
 
     // A real citation written next to the wrong case name is the classic made-up reference.
     const named = caseNameBefore(text.slice(Math.max(prevEnd, cite.span[0] - 200), cite.span[0]));
@@ -112,6 +116,12 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
       }
     }
 
+    // A case name written in another script cannot be compared with the record's English title. Say so, and show the record.
+    const nameNote =
+      !named && INDIC_LETTERS.test(text.slice(Math.max(prevEnd, cite.span[0] - 120), cite.span[0]))
+        ? `The case name was written in another script, so it was not compared with the record. The library lists this citation as "${record.title}".`
+        : null;
+
     const quote = quoteNear(text, [prevEnd, cite.span[0]], [cite.span[1], nextStart]);
     const citedPara = paraNear(paraCites, cite.span[0], cite.span[1], nextStart);
 
@@ -119,7 +129,7 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
       verdicts.push(
         quote
           ? { ...found, status: "partial", reason: "no_text", quote, warning: "The case is in the library but its judgment text is not, so the quote could not be checked." }
-          : { ...found, status: "verified", reason: "ok", level: "citation" },
+          : { ...found, status: "verified", reason: "ok", level: "citation", ...(nameNote ? { warning: nameNote } : {}) },
       );
       continue;
     }
@@ -149,7 +159,7 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
       continue;
     }
 
-    verdicts.push({ ...found, status: "verified", reason: "ok", level: "citation", ...(citedPara ? { para: citedPara } : {}) });
+    verdicts.push({ ...found, status: "verified", reason: "ok", level: "citation", ...(citedPara ? { para: citedPara } : {}), ...(nameNote ? { warning: nameNote } : {}) });
   }
 
   const counts = { verified: 0, partial: 0, unverified: 0 };

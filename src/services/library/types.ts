@@ -33,6 +33,8 @@ export interface LibraryCase {
   /** How the library prints this case, for example "(1992 Supp (1) SCC 335)". Always built from the record, never from model text. */
   citation_text: string;
   source_url?: string | null;
+  /** Languages the Court officially publishes this judgment in, as its own codes (ENG, HIN, MAR, KAN, TAM, TEL ...). Empty when unknown. */
+  languages?: string[];
   /** Number of numbered paragraphs held. 0 means only the record is in the library, not the judgment text. */
   para_count: number;
 }
@@ -79,6 +81,8 @@ export interface CiteVerdict {
   quote?: string;
   source_url?: string | null;
   warning?: string;
+  /** Official translations of this judgment (language codes other than English), when the library knows them. */
+  translations?: string[];
 }
 
 export interface VerifyResult {

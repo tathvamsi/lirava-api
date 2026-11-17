@@ -1,4 +1,5 @@
 import { pgData } from "../data/pg.js";
+import { isDocumentLanguage } from "../agent/language.js";
 
 /**
  * Small per-user settings that used to live in the browser (so they were lost on a new device and could
@@ -19,6 +20,8 @@ const VALIDATORS: Record<string, Validator> = {
     }
     return clean;
   },
+  /** The language the user wants documents written in: en, hi, kn, ta, te or mr. When unset, the assistant asks before writing a document. */
+  documentLanguage: (value) => (isDocumentLanguage(value) ? value : undefined),
   /** Width in pixels of the document preview beside a chat. */
   artifactBoardWidth: (value) => (typeof value === "number" && Number.isFinite(value) && value >= 280 && value <= 2400 ? Math.round(value) : undefined),
 };

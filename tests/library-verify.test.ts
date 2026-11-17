@@ -298,3 +298,107 @@ describe("Supreme Court Reports and neutral citations, as the Court prints them"
     assert.equal(v.reason, "no_text");
   });
 });
+
+describe("statutes written in Hindi, Marathi, Kannada, Tamil and Telugu", () => {
+  const statutes = (text: string) =>
+    extractCitations(text)
+      .filter((c) => c.kind === "statute")
+      .map(canonicalKey);
+
+  const yes: Array<[string, string, string[]]> = [
+    ["Hindi: Act then section", "भारतीय दंड संहिता की धारा 302 के अंतर्गत", ["IPC:302"]],
+    ["Hindi: section then abbreviation", "धारा 302 आईपीसी", ["IPC:302"]],
+    ["Hindi: Devanagari digits", "धारा ३०२ भारतीय दंड संहिता", ["IPC:302"]],
+    ["Hindi: BNS", "भारतीय न्याय संहिता की धारा 103", ["BNS:103"]],
+    ["Hindi: BNSS", "धारा 482 बीएनएसएस के तहत", ["BNSS:482"]],
+    ["Hindi: NI Act", "धारा 138 परक्राम्य लिखत अधिनियम", ["NIA:138"]],
+    ["Hindi: Evidence Act with its year", "धारा 65B भारतीय साक्ष्य अधिनियम, 1872", ["IEA:65B"]],
+    ["Hindi: Sakshya Adhiniyam 2023", "धारा 63 भारतीय साक्ष्य अधिनियम, 2023", ["BSA:63"]],
+    ["Hindi: Latin abbreviation kept", "IPC की धारा 420", ["IPC:420"]],
+    ["Hindi: two sections", "धारा 3 और 4 सीआरपीसी", ["CRPC:3", "CRPC:4"]],
+    ["Marathi: kalam", "कलम 420 भारतीय दंड संहिता", ["IPC:420"]],
+    ["Marathi: Latin abbreviation", "कलम ३०२ IPC", ["IPC:302"]],
+    ["Marathi: BNS", "कलम 103 भारतीय न्याय संहिता", ["BNS:103"]],
+    ["Kannada: Act then section", "ಭಾರತೀಯ ದಂಡ ಸಂಹಿತೆಯ ಕಲಂ 302", ["IPC:302"]],
+    ["Kannada: abbreviation", "ಕಲಂ 302 ಐಪಿಸಿ", ["IPC:302"]],
+    ["Kannada: Kannada digits", "ಕಲಂ ೩೦೨ IPC", ["IPC:302"]],
+    ["Kannada: BNS", "ಭಾರತೀಯ ನ್ಯಾಯ ಸಂಹಿತೆ ಕಲಂ 103", ["BNS:103"]],
+    ["Tamil: Act then section", "இந்திய தண்டனைச் சட்டப் பிரிவு 302", ["IPC:302"]],
+    ["Tamil: abbreviation", "பிரிவு 302 ஐபிசி", ["IPC:302"]],
+    ["Tamil: Tamil digits", "பிரிவு ௩௦௨ IPC", ["IPC:302"]],
+    ["Tamil: CrPC", "குற்றவியல் நடைமுறைச் சட்டம் பிரிவு 438", ["CRPC:438"]],
+    ["Telugu: Latin Act name", "సెక్షన్ 138 NI Act", ["NIA:138"]],
+    ["Telugu: Act then section", "భారతీయ శిక్షాస్మృతి సెక్షన్ 302", ["IPC:302"]],
+    ["Telugu: abbreviation", "సెక్షన్ 302 ఐపీసీ", ["IPC:302"]],
+  ];
+  for (const [name, text, want] of yes) {
+    it(`reads ${name}`, () => assert.deepEqual(statutes(text).sort(), [...want].sort()));
+  }
+
+  const no: Array<[string, string]> = [
+    ["a section number with no Act", "धारा 302 के अनुसार"],
+    ["the Sakshya Adhiniyam without a year, which names two different Acts", "धारा 63 भारतीय साक्ष्य अधिनियम"],
+    ["an Act with no section", "भारतीय दंड संहिता एक पुरानी संहिता है"],
+    ["an unknown Act", "ಕಲಂ 12 ಕರ್ನಾಟಕ ಭೂ ಸುಧಾರಣೆ ಕಾಯ್ದೆ"],
+    ["a far-away Act name", "धारा 302 के बारे में बात करते हुए हमने बहुत लंबी चर्चा की और अंत में आईपीसी"],
+  ];
+  for (const [name, text] of no) {
+    it(`does not read ${name}`, () => assert.deepEqual(statutes(text), []));
+  }
+
+  it("keeps spans pointing at the original text, native digits included", () => {
+    const text = "आरोपी पर धारा ३०२ भारतीय दंड संहिता लगी है।";
+    const [c] = extractCitations(text);
+    assert.equal(c.raw, text.slice(c.span[0], c.span[1]));
+    assert.match(c.raw, /^धारा ३०२/);
+  });
+
+  it("reads case citations written with native digits", () => {
+    assert.deepEqual(keysOf("(२०१४) ९ SCC १२९"), ["SCC:2014:9:129"]);
+    assert.deepEqual(keysOf("२०२३ INSC १०४३"), ["INSC:2023:1043"]);
+  });
+
+  it("verifies a Hindi section citation against the library", async () => {
+    const store = new MemoryLibraryStore().addProvision({ id: "BNS:103", act_code: "BNS", section_num: "103", title: "Punishment for murder", source: null });
+    const { verdicts } = await verifyAnswer("भारतीय न्याय संहिता की धारा १०३ हत्या के लिए दंड का प्रावधान करती है।", store);
+    assert.equal(verdicts.length, 1);
+    assert.equal(verdicts[0].status, "verified");
+    assert.equal(verdicts[0].library_title, "Punishment for murder");
+  });
+});
+
+describe("case names written in another script", () => {
+  const store = new MemoryLibraryStore().addCase(
+    { id: "scj:2023_16_872_887", title: "ELDECO HOUSING AND INDUSTRIES LIMITED v. ASHOK VIDYARTHI AND OTHERS", court: "Supreme Court of India", year: 2023, citation_text: "[2023] 16 S.C.R. 872; 2023 INSC 1043", source_url: null },
+    ["[2023] 16 S.C.R. 872", "2023 INSC 1043"],
+  );
+
+  it("verifies the citation and says the name was not compared", async () => {
+    const { verdicts } = await verifyAnswer("एल्डेको हाउसिंग बनाम अशोक विद्यार्थी, 2023 INSC 1043 में सर्वोच्च न्यायालय ने यह कहा।", store);
+    assert.equal(verdicts[0].status, "verified");
+    assert.match(verdicts[0].warning ?? "", /another script.*ELDECO HOUSING/);
+  });
+
+  it("adds no such note when the name is in English", async () => {
+    const { verdicts } = await verifyAnswer("Eldeco Housing v. Ashok Vidyarthi, 2023 INSC 1043.", store);
+    assert.equal(verdicts[0].warning, undefined);
+  });
+
+  it("still rejects an invented number written in a Hindi sentence", async () => {
+    const { verdicts } = await verifyAnswer("एल्डेको हाउसिंग बनाम अशोक विद्यार्थी, 2023 INSC 9999।", store);
+    assert.equal(verdicts[0].status, "unverified");
+  });
+});
+
+describe("official translations of a judgment", () => {
+  const store = new MemoryLibraryStore().addCase(
+    { id: "scj:x", title: "STATE OF KARNATAKA v. SOME PERSON", court: "Supreme Court of India", year: 2021, citation_text: "2021 INSC 100", source_url: null, languages: ["ENG", "HIN", "KAN"] },
+    ["2021 INSC 100"],
+  );
+
+  it("lists the languages other than English in which the Court publishes the judgment", async () => {
+    const { verdicts } = await verifyAnswer("State of Karnataka v. Some Person, 2021 INSC 100.", store);
+    assert.equal(verdicts[0].status, "verified");
+    assert.deepEqual(verdicts[0].translations, ["HIN", "KAN"]);
+  });
+});

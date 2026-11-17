@@ -12,6 +12,9 @@ What each record carries: parties, bench, decision date, the neutral citation ("
 Reports citation ("[2023] 16 S.C.R. 872"), the CNR, and the file name of the judgment PDF. No SCC or AIR citation is in
 this source, so those cannot be verified from it.
 
+`languages` lists the official translations the Court publishes (ENG, HIN, MAR, KAN, TAM, TEL ...), so the library can say
+which judgments have one. Translations are for information only; the English text is the authority.
+
 The files repeat some rows exactly (about 5,200 of 43,600). Rows are keyed by the judgment's PDF path and kept once.
 
 Usage:  python extract_sc_metadata.py <dir with the year files, named m<year>.parquet> <out_dir>
@@ -27,7 +30,7 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 
-COLS = ["title", "petitioner", "respondent", "judge", "citation", "case_id", "cnr", "decision_date", "disposal_nature", "path", "year", "court"]
+COLS = ["title", "petitioner", "respondent", "judge", "citation", "case_id", "cnr", "decision_date", "disposal_nature", "path", "year", "court", "available_languages"]
 NEUTRAL = re.compile(r"^\d{4} INSC \d{1,5}$")
 SCR = re.compile(r"^\[\d{4}\] (?:SUPP\. )?\d{1,3} S\.C\.R\. \d{1,5}$")
 
@@ -93,6 +96,7 @@ def main(src: str, out_dir: str) -> None:
                 "disposal": squash(r["disposal_nature"]),
                 "neutral_citation": neutral,
                 "scr_citation": scr,
+                "languages": [l for l in dict.fromkeys(x.strip().upper() for x in (r["available_languages"] or "").split(",")) if l],
                 "cnr": squash(r["cnr"]),
                 "pdf_path": path,
                 "dataset": "indian-supreme-court-judgments (AWS Open Data, metadata/parquet)",

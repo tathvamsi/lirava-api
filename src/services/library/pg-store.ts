@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS library_judgments (
   licence          TEXT NOT NULL,
   ingested_at      BIGINT NOT NULL
 );
+ALTER TABLE library_judgments ADD COLUMN IF NOT EXISTS languages TEXT;
 CREATE INDEX IF NOT EXISTS library_judgments_year_idx ON library_judgments (year);
 
 -- Statute sections loaded from an official-text dataset, one row per section, with where each came from.
@@ -139,6 +140,7 @@ interface JudgmentRow {
   year: number;
   neutral_citation: string | null;
   scr_citation: string | null;
+  languages: string | null;
 }
 
 // No paragraphs are stored for these, so the verifier can confirm the citation and the case name but not a quotation.
@@ -149,6 +151,7 @@ const toJudgmentCase = (r: JudgmentRow): LibraryCase => ({
   year: r.year,
   citation_text: [r.scr_citation, r.neutral_citation].filter(Boolean).join("; "),
   source_url: null,
+  languages: r.languages ? r.languages.split(",") : [],
   para_count: 0,
 });
 
@@ -163,7 +166,7 @@ export class PgLibraryStore implements LibraryStore {
       FROM library_cite_keys k JOIN legal_cases c ON c.id = k.case_id
       WHERE k.key = ${key}`;
     const judgments = await sql<JudgmentRow[]>`
-      SELECT j.id, j.title, j.court, j.year, j.neutral_citation, j.scr_citation
+      SELECT j.id, j.title, j.court, j.year, j.neutral_citation, j.scr_citation, j.languages
       FROM library_cite_keys k JOIN library_judgments j ON j.id = k.case_id
       WHERE k.key = ${key}`;
     return [...rows.map(toCase), ...judgments.map(toJudgmentCase)];
@@ -179,7 +182,7 @@ export class PgLibraryStore implements LibraryStore {
       FROM legal_cases c WHERE c.id = ${id}`;
     if (rows[0]) return toCase(rows[0]);
     const judgments = await sql<JudgmentRow[]>`
-      SELECT id, title, court, year, neutral_citation, scr_citation FROM library_judgments WHERE id = ${id}`;
+      SELECT id, title, court, year, neutral_citation, scr_citation, languages FROM library_judgments WHERE id = ${id}`;
     return judgments[0] ? toJudgmentCase(judgments[0]) : null;
   }
 
@@ -249,6 +252,8 @@ export interface LibraryJudgmentRow {
   scr_citation: string | null;
   cnr: string | null;
   pdf_path: string | null;
+  /** Comma-separated language codes, for example "ENG,HIN,KAN". */
+  languages: string | null;
   dataset: string;
   licence: string;
 }
@@ -265,11 +270,11 @@ export async function upsertLibraryJudgments(rows: LibraryJudgmentRow[]): Promis
     const slice = rows.slice(i, i + 500);
     const batch = slice.map((r) => ({ ...r, ingested_at: now }));
     await sql`
-      INSERT INTO library_judgments ${sql(batch, "id", "title", "petitioner", "respondent", "court", "year", "decision_date", "bench", "disposal", "neutral_citation", "scr_citation", "cnr", "pdf_path", "dataset", "licence", "ingested_at")}
+      INSERT INTO library_judgments ${sql(batch, "id", "title", "petitioner", "respondent", "court", "year", "decision_date", "bench", "disposal", "neutral_citation", "scr_citation", "cnr", "pdf_path", "languages", "dataset", "licence", "ingested_at")}
       ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, petitioner = EXCLUDED.petitioner, respondent = EXCLUDED.respondent,
         court = EXCLUDED.court, year = EXCLUDED.year, decision_date = EXCLUDED.decision_date, bench = EXCLUDED.bench,
         disposal = EXCLUDED.disposal, neutral_citation = EXCLUDED.neutral_citation, scr_citation = EXCLUDED.scr_citation,
-        cnr = EXCLUDED.cnr, pdf_path = EXCLUDED.pdf_path, dataset = EXCLUDED.dataset, licence = EXCLUDED.licence,
+        cnr = EXCLUDED.cnr, pdf_path = EXCLUDED.pdf_path, languages = EXCLUDED.languages, dataset = EXCLUDED.dataset, licence = EXCLUDED.licence,
         ingested_at = EXCLUDED.ingested_at`;
     judgments += batch.length;
     const keyRows = slice.flatMap((r) =>
