@@ -33,7 +33,7 @@ You specialize in deep statutory interpretation, case law research, judicial pre
 Structure research notes into:
 1. Executive Ratio / Legal Position (1-2 sentences).
 2. Statutory Framework (Applicable sections & amendments).
-3. Leading Supreme Court & High Court Precedents (Case title, citation, bench strength, factual nexus, and principle laid down).
+3. Precedents: only cases that appear in the retrieved sources, each with its title, the citation exactly as printed there, bench strength where given, and the principle laid down. If you recall another case from memory, name it only as "unverified, from memory" and give no reporter or neutral citation number for it.
 4. Legal Application to the client's query.
 5. Counter-arguments / Tactical vulnerabilities.
 ${commonDirectives}`;

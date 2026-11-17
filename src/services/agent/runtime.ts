@@ -362,7 +362,7 @@ export async function sendMessage(
       sections.push({
         id: "statutes",
         text: ragResult.contextText,
-        tail: `LEGAL COUNSEL DIRECTIVES FOR RETRIEVED STATUTES & PRECEDENTS:\n- Formulate your legal advice and drafting strictly grounded upon the statutory sections and judicial precedents provided above.\n- State exact sections (BNSS, BNS, BSA, CPC, NI Act), statutory ingredients, and relevant ratios.\n- Do NOT output synthetic platform banners or watermarks. Provide authentic courtroom counsel.`,
+        tail: `LEGAL COUNSEL DIRECTIVES FOR RETRIEVED STATUTES & PRECEDENTS:\n- Formulate your legal advice and drafting strictly grounded upon the statutory sections and judicial precedents provided above.\n- State exact sections (BNSS, BNS, BSA, CPC, NI Act), statutory ingredients, and relevant ratios.\n- Cite a case or section only if it appears in the sources above, with its citation exactly as printed there. Any other authority you mention must be marked "unverified, from memory" and given without a reporter or neutral citation number. Never invent a paragraph number or a quotation.\n- Do NOT output synthetic platform banners or watermarks. Provide authentic courtroom counsel.`,
         floorTokens: 350,
         shedOrder: 50,
       });
