@@ -86,6 +86,23 @@ describe("per-user preferences (read marks, preview width)", () => {
     assert.deepEqual((await getSnapshot(bob.id)).preferences, {});
   });
 
+  it("saves the document language, returns it with the snapshot, and clears it with null", async () => {
+    assert.equal((await send(alice, "PUT", "/api/preferences/documentLanguage", { value: "kn" })).status, 200);
+    assert.equal((await (await send(alice, "GET", "/api/preferences")).json()).preferences.documentLanguage, "kn");
+    assert.equal((await getSnapshot(alice.id)).preferences?.documentLanguage, "kn");
+    assert.equal((await getSnapshot(bob.id)).preferences?.documentLanguage, undefined, "Bob never sees Alice's choice");
+
+    assert.equal((await send(alice, "PUT", "/api/preferences/documentLanguage", { value: "klingon" })).status, 400, "not one of the six");
+    assert.equal((await send(alice, "PUT", "/api/preferences/documentLanguage", { value: null })).status, 200, "null puts it back to not chosen");
+    assert.equal((await (await send(alice, "GET", "/api/preferences")).json()).preferences.documentLanguage, undefined);
+    assert.equal((await send(alice, "PUT", "/api/preferences/documentLanguage", { value: null })).status, 200, "clearing twice is harmless");
+  });
+
+  it("lets only the document language be cleared with null", async () => {
+    assert.equal((await send(alice, "PUT", "/api/preferences/artifactBoardWidth", { value: null })).status, 400);
+    assert.equal((await send(alice, "PUT", "/api/preferences/lastRead", { value: null })).status, 400);
+  });
+
   it("refuses unknown keys and values that do not fit", async () => {
     assert.equal((await send(alice, "PUT", "/api/preferences/somethingElse", { value: 1 })).status, 404);
     assert.equal((await send(alice, "PUT", "/api/preferences/artifactBoardWidth", { value: 5 })).status, 400, "too narrow");

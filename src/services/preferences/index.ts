@@ -41,7 +41,16 @@ export async function getPreferences(userId: string): Promise<Record<string, unk
   return out;
 }
 
+/** Preferences that can be cleared by saving null, which puts the user back to "not chosen" (for the document language, the assistant asks again). */
+const CLEARABLE = new Set(["documentLanguage"]);
+
 export async function setPreference(userId: string, key: string, value: unknown): Promise<boolean> {
+  if (value === null && CLEARABLE.has(key)) {
+    if (!userId) return false;
+    const sql = await pgData();
+    await sql`DELETE FROM user_preferences WHERE user_id = ${userId} AND key = ${key}`;
+    return true;
+  }
   const valid = validatePreference(key, value);
   if (!userId || valid === undefined) return false;
   const sql = await pgData();
