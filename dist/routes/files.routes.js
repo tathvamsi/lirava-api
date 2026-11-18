@@ -1,24 +1,25 @@
 import { Hono } from "hono";
-import { getFile } from "../services/files/index.js";
+import { getFileForUser } from "../services/files/index.js";
+import { contentDisposition, isInlineSafe } from "../services/files/http.js";
+import { requireAuth } from "../middleware/auth.js";
 export const filesRoutes = new Hono();
-filesRoutes.get("/:id", (c) => {
-    const fileId = c.req.param("id");
-    const file = getFile(fileId);
-    if (!file) {
-        return c.text("File not found", 404);
-    }
-    const download = c.req.query("download") === "1";
-    const safeFilename = file.name.replace(/["\r\n]/g, "");
-    const disposition = download
-        ? `attachment; filename="${safeFilename}"`
-        : `inline; filename="${safeFilename}"`;
-    return new Response(file.data, {
+filesRoutes.use("*", requireAuth);
+filesRoutes.get("/:id", async (c) => {
+    // Someone else's file looks exactly like a file that does not exist.
+    const file = await getFileForUser(c.req.param("id"), c.get("user").id);
+    if (!file)
+        return c.json({ error: "File not found" }, 404);
+    // Only formats a browser can display safely open in the page. Anything else downloads.
+    const inline = c.req.query("download") !== "1" && isInlineSafe(file.mime);
+    return new Response(new Uint8Array(file.data), {
         status: 200,
         headers: {
             "Content-Type": file.mime,
-            "Content-Disposition": disposition,
+            "Content-Disposition": contentDisposition(inline ? "inline" : "attachment", file.name),
             "Content-Length": String(file.size),
-            "Cache-Control": "public, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Cache-Control": "private, no-store",
         },
     });
 });

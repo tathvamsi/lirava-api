@@ -2,18 +2,41 @@ import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { onEvent } from "../services/bus/index.js";
 import { getSnapshot } from "../services/repo/index.js";
+import { runningFor } from "../services/agent/runtime.js";
+import { requireAuth } from "../middleware/auth.js";
 export const eventsRoutes = new Hono();
+eventsRoutes.use("*", requireAuth);
+/**
+ * An event reaches a client only if it is addressed to that user. Events with no
+ * owner are limited to shared Vakil (`vakil*`) changes, which carry no chat content.
+ */
+export function eventVisibleTo(event, userId) {
+    if (event.userId)
+        return event.userId === userId;
+    return typeof event.type === "string" && event.type.startsWith("vakil");
+}
 eventsRoutes.get("/", (c) => {
-    const userId = c.req.query("userId") || "usr-super-admin";
+    const userId = c.get("user").id;
     console.log(`\x1b[35m[events-sse]\x1b[0m ⚡ SSE client connected (userId: ${userId})`);
     return streamSSE(c, async (stream) => {
-        // 1. Initial snapshot formatted as { type: "snapshot", data: Snapshot }
-        const snapshot = getSnapshot(userId);
+        // 1. Initial snapshot, built only from this user's data
+        let snapshot;
+        try {
+            // Includes the answers currently being written, so a page opened or reloaded mid-answer still shows them.
+            snapshot = { ...(await getSnapshot(userId)), running: runningFor(userId) };
+        }
+        catch (err) {
+            console.error("[events-sse] Failed to build snapshot:", err);
+            await stream.writeSSE({ data: JSON.stringify({ type: "error", error: "Could not load your workspace." }) });
+            return;
+        }
         await stream.writeSSE({
             data: JSON.stringify({ type: "snapshot", data: snapshot }),
         });
-        // 2. Subscribe to event bus and stream all server events
+        // 2. Subscribe to the event bus, forwarding only this user's events
         const unsubscribe = onEvent(async (event) => {
+            if (!eventVisibleTo(event, userId))
+                return;
             try {
                 await stream.writeSSE({
                     data: JSON.stringify(event),

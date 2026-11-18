@@ -23,11 +23,11 @@ export class SoliBackendClient {
             throw new Error(`Agent error: ${res.statusText}`);
         return res.json();
     }
-    async abortAgent(dotId) {
+    async abortVakil(vakilId) {
         const res = await fetch(`${this.baseUrl}/api/agent/abort`, {
             method: "POST",
             headers: this.headers,
-            body: JSON.stringify({ dotId }),
+            body: JSON.stringify({ vakilId }),
         });
         return res.json();
     }

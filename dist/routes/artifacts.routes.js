@@ -1,91 +1,111 @@
 import { Hono } from "hono";
-import { listArtifacts, saveArtifact } from "../services/repo/index.js";
-import { generateCourtPdf, generateCourtDocx } from "../services/legal/court-engine.js";
+import { deleteArtifactForUser, findDuplicateArtifact, getArtifactForUser, listArtifacts, saveArtifact, } from "../services/repo/index.js";
+import { generateDocumentDocx, generateDocumentPdf, UnsupportedTextError } from "../services/legal/documents.js";
 import { saveFile } from "../services/files/index.js";
+import { getConversation } from "../services/chats/store.js";
+import { requireAuth } from "../middleware/auth.js";
+import { contentDisposition } from "../services/files/http.js";
 export const artifactsRoutes = new Hono();
-artifactsRoutes.get("/", (c) => {
-    const userId = c.req.query("userId") || "";
-    const artifacts = listArtifacts(userId, { agentOnly: c.req.query("agentOnly") === "true" });
+artifactsRoutes.use("*", requireAuth);
+const MAX_CONTENT_CHARS = 500_000;
+artifactsRoutes.get("/", async (c) => {
+    const userId = c.get("user").id;
+    const artifacts = await listArtifacts(userId, { agentOnly: c.req.query("agentOnly") === "true" });
     return c.json({ artifacts });
 });
 artifactsRoutes.post("/", async (c) => {
+    const userId = c.get("user").id;
     try {
         const body = await c.req.json();
-        let pdfFileId = body.pdfFileId || null;
-        const title = body.title || "Legal Agreement";
-        const filename = body.filename || `${title.toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(0, 50)}.pdf`;
-        // Automatically generate court PDF if not provided so PDF preview & download work immediately!
-        if (!pdfFileId && body.content) {
-            try {
-                const pdfBytes = await generateCourtPdf({
-                    courtName: "In the High Court of Judicature",
-                    caseType: body.kind === "contract" ? "Commercial Agreement" : "Legal Document",
-                    petitioner: title,
-                    respondent: "Parties Concerned",
-                    grounds: [body.content.slice(0, 400)],
-                    prayers: ["Document presented for record and legal compliance."],
-                });
-                const saved = saveFile(body.dotId || "vakil_dev", filename, "application/pdf", Buffer.from(pdfBytes), body.userId || "");
-                pdfFileId = saved.id;
-            }
-            catch (pdfErr) {
-                console.warn("Could not auto-generate PDF for artifact:", pdfErr);
-            }
+        const title = (typeof body.title === "string" && body.title.trim() ? body.title.trim() : "Legal Document").slice(0, 200);
+        const content = typeof body.content === "string" ? body.content : "";
+        const vakilId = typeof body.vakilId === "string" && body.vakilId ? body.vakilId : "vakil_dev";
+        const conversationId = typeof body.conversationId === "string" && body.conversationId ? body.conversationId : null;
+        if (!content.trim())
+            return c.json({ error: "A document needs some content." }, 400);
+        if (content.length > MAX_CONTENT_CHARS)
+            return c.json({ error: "This document is too large to save." }, 413);
+        // A document can only be attached to a chat the user owns.
+        if (conversationId && !(await getConversation(conversationId, userId))) {
+            return c.json({ error: "Conversation not found." }, 404);
         }
-        const artifact = saveArtifact({
-            ...body,
+        // Saving the same document again returns the saved copy instead of creating duplicates.
+        const existing = await findDuplicateArtifact(userId, conversationId, title, content);
+        if (existing)
+            return c.json({ success: true, artifact: existing });
+        const filename = `${title.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 50) || "document"}.pdf`;
+        // Generate the PDF up front so preview and download work immediately. Text the PDF can't
+        // render (for example Hindi) is still saved: the Word version carries it in full.
+        let pdfFileId = null;
+        try {
+            const pdfBytes = await generateDocumentPdf({ title, content });
+            pdfFileId = (await saveFile(vakilId, filename, "application/pdf", Buffer.from(pdfBytes), userId)).id;
+        }
+        catch (pdfErr) {
+            if (!(pdfErr instanceof UnsupportedTextError))
+                console.warn("[artifacts] Could not generate PDF:", pdfErr);
+        }
+        const artifact = await saveArtifact({
+            vakilId,
+            conversationId,
+            title,
+            content,
             filename,
+            kind: typeof body.kind === "string" ? body.kind : undefined,
+            summary: typeof body.summary === "string" ? body.summary.slice(0, 500) : undefined,
             pdfFileId,
+            userId,
         });
         return c.json({ success: true, artifact });
     }
     catch (err) {
-        return c.json({ error: err.message }, 500);
+        console.error("[artifacts] save failed:", err);
+        return c.json({ error: "Could not save the document." }, 500);
     }
 });
-artifactsRoutes.get("/:id", (c) => {
-    const id = c.req.param("id");
-    const artifacts = listArtifacts();
-    const artifact = artifacts.find((a) => a.id === id);
+artifactsRoutes.get("/:id", async (c) => {
+    const artifact = await getArtifactForUser(c.req.param("id"), c.get("user").id);
     if (!artifact)
         return c.json({ error: "Artifact not found" }, 404);
     return c.json({ artifact });
 });
+artifactsRoutes.delete("/:id", async (c) => {
+    if (!(await deleteArtifactForUser(c.req.param("id"), c.get("user").id)))
+        return c.json({ error: "Artifact not found" }, 404);
+    return c.json({ success: true });
+});
 artifactsRoutes.get("/:id/export", async (c) => {
-    const id = c.req.param("id");
-    const format = c.req.query("format") || "pdf";
-    const artifacts = listArtifacts();
-    const artifact = artifacts.find((a) => a.id === id);
+    const artifact = await getArtifactForUser(c.req.param("id"), c.get("user").id);
     if (!artifact)
         return c.json({ error: "Artifact not found" }, 404);
+    const format = c.req.query("format") === "docx" ? "docx" : "pdf";
+    const base = artifact.title || "document";
     try {
-        // Generate court document
-        const pleadingData = {
-            courtName: "In the High Court of Judicature",
-            caseType: "Legal Pleading",
-            petitioner: "Petitioner",
-            respondent: "Respondent",
-            grounds: [artifact.content.slice(0, 300) || "Grounds of petition"],
-            prayers: ["Prayer for relief as set forth herein."],
-        };
         if (format === "docx") {
-            const docx = await generateCourtDocx(pleadingData);
-            return new Response(docx, {
+            const docx = await generateDocumentDocx({ title: artifact.title, content: artifact.content });
+            return new Response(new Uint8Array(docx), {
                 headers: {
                     "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    "Content-Disposition": `attachment; filename="${artifact.title || "document"}.docx"`,
+                    "Content-Disposition": contentDisposition("attachment", `${base}.docx`),
+                    "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "private, no-store",
                 },
             });
         }
-        const pdf = await generateCourtPdf(pleadingData);
-        return new Response(pdf, {
+        const pdf = await generateDocumentPdf({ title: artifact.title, content: artifact.content });
+        return new Response(new Uint8Array(pdf), {
             headers: {
                 "Content-Type": "application/pdf",
-                "Content-Disposition": `attachment; filename="${artifact.title || "document"}.pdf"`,
+                "Content-Disposition": contentDisposition("attachment", `${base}.pdf`),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
             },
         });
     }
     catch (err) {
-        return c.json({ error: err.message }, 500);
+        if (err instanceof UnsupportedTextError)
+            return c.json({ error: err.message, alternative: "docx" }, 422);
+        console.error("[artifacts] export failed:", err);
+        return c.json({ error: "Could not generate the document." }, 500);
     }
 });

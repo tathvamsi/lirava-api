@@ -1,53 +1,35 @@
-import { getDb } from "../db/index.js";
 import crypto from "node:crypto";
-export function listNodes() {
-    const db = getDb();
-    return db.prepare("SELECT * FROM admin_inference_nodes ORDER BY created_at DESC").all();
+import { pgData } from "../data/pg.js";
+const toNode = (r) => ({
+    ...r,
+    enabled: Number(r.enabled),
+    is_draining: Number(r.is_draining),
+    active_connections: Number(r.active_connections),
+    vram_used_bytes: Number(r.vram_used_bytes),
+    vram_total_bytes: Number(r.vram_total_bytes),
+    latency_ms: Number(r.latency_ms),
+});
+export async function listNodes() {
+    const sql = await pgData();
+    return (await sql `SELECT * FROM app_nodes ORDER BY created_at DESC`).map(toNode);
 }
-export function registerNode(data) {
-    const db = getDb();
+export async function registerNode(data) {
+    const sql = await pgData();
     const id = `node-${crypto.randomUUID()}`;
     const now = new Date().toISOString();
-    const record = {
-        id,
-        name: data.name,
-        address: data.address,
-        status: "healthy",
-        enabled: 1,
-        is_draining: 0,
-        active_connections: 0,
-        vram_used_bytes: 0,
-        vram_total_bytes: data.vram_total_bytes || 16 * 1024 * 1024 * 1024, // 16GB
-        latency_ms: 25,
-        loaded_model_id: null,
-        last_heartbeat_at: now,
-        created_at: now,
-    };
-    db.prepare(`
-    INSERT INTO admin_inference_nodes (
-      id, name, address, status, enabled, is_draining, active_connections,
-      vram_used_bytes, vram_total_bytes, latency_ms, loaded_model_id, last_heartbeat_at, created_at
-    ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-    )
-  `).run(record.id, record.name, record.address, record.status, record.enabled, record.is_draining, record.active_connections, record.vram_used_bytes, record.vram_total_bytes, record.latency_ms, record.loaded_model_id ?? null, record.last_heartbeat_at, record.created_at);
-    return record;
+    const rows = await sql `
+    INSERT INTO app_nodes (id, name, address, status, enabled, is_draining, active_connections, vram_used_bytes, vram_total_bytes, latency_ms, last_heartbeat_at, created_at)
+    VALUES (${id}, ${data.name}, ${data.address}, 'healthy', 1, 0, 0, 0, ${data.vram_total_bytes || 16 * 1024 * 1024 * 1024}, 25, ${now}, ${now})
+    RETURNING *`;
+    return toNode(rows[0]);
 }
-export function toggleDrainNode(nodeId) {
-    const db = getDb();
-    const node = db.prepare("SELECT * FROM admin_inference_nodes WHERE id = ?").get(nodeId);
-    if (!node)
-        return { success: false, error: "Node not found" };
-    const nextDrain = node.is_draining ? 0 : 1;
-    db.prepare("UPDATE admin_inference_nodes SET is_draining = ? WHERE id = ?").run(nextDrain, nodeId);
-    return { success: true, is_draining: nextDrain };
+export async function toggleDrainNode(nodeId) {
+    const sql = await pgData();
+    const rows = await sql `UPDATE app_nodes SET is_draining = 1 - is_draining WHERE id = ${nodeId} RETURNING is_draining`;
+    return rows[0] ? { success: true, is_draining: Number(rows[0].is_draining) } : { success: false, error: "Node not found" };
 }
-export function toggleEnableNode(nodeId) {
-    const db = getDb();
-    const node = db.prepare("SELECT * FROM admin_inference_nodes WHERE id = ?").get(nodeId);
-    if (!node)
-        return { success: false, error: "Node not found" };
-    const nextEnabled = node.enabled ? 0 : 1;
-    db.prepare("UPDATE admin_inference_nodes SET enabled = ? WHERE id = ?").run(nextEnabled, nodeId);
-    return { success: true, enabled: nextEnabled };
+export async function toggleEnableNode(nodeId) {
+    const sql = await pgData();
+    const rows = await sql `UPDATE app_nodes SET enabled = 1 - enabled WHERE id = ${nodeId} RETURNING enabled`;
+    return rows[0] ? { success: true, enabled: Number(rows[0].enabled) } : { success: false, error: "Node not found" };
 }

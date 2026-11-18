@@ -1,4 +1,5 @@
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { drawableLine } from "./documents.js";
 import { Document, Paragraph, TextRun, HeadingLevel, AlignmentType, Packer } from "docx";
 export async function generateCourtPdf(data) {
     const pdfDoc = await PDFDocument.create();
@@ -11,7 +12,8 @@ export async function generateCourtPdf(data) {
     const rightMargin = 72;
     const contentWidth = width - leftMargin - rightMargin;
     let y = height - 72;
-    const drawCentered = (text, font = timesBold, size = 12) => {
+    const drawCentered = (raw, font = timesBold, size = 12) => {
+        const text = drawableLine(font, raw);
         const textWidth = font.widthOfTextAtSize(text, size);
         page.drawText(text, {
             x: leftMargin + (contentWidth - textWidth) / 2,
@@ -22,8 +24,8 @@ export async function generateCourtPdf(data) {
         });
         y -= size + 8;
     };
-    const drawParagraph = (text, font = timesRoman, size = 11, lineSpacing = 16) => {
-        const words = text.split(" ");
+    const drawParagraph = (raw, font = timesRoman, size = 11, lineSpacing = 16) => {
+        const words = drawableLine(font, raw).split(" ");
         let line = "";
         for (const word of words) {
             const testLine = line + (line ? " " : "") + word;
@@ -59,13 +61,13 @@ export async function generateCourtPdf(data) {
     // 2. Parties
     page.drawText("IN THE MATTER OF:", { x: leftMargin, y, size: 11, font: timesBold });
     y -= 18;
-    page.drawText(`${data.petitioner}`, { x: leftMargin, y, size: 11, font: timesBold });
+    page.drawText(drawableLine(timesBold, data.petitioner), { x: leftMargin, y, size: 11, font: timesBold });
     const petWidth = timesBold.widthOfTextAtSize("... PETITIONER", 11);
     page.drawText("... PETITIONER", { x: width - rightMargin - petWidth, y, size: 11, font: timesBold });
     y -= 18;
     drawCentered("VERSUS", timesBold, 10);
     y -= 8;
-    page.drawText(`${data.respondent}`, { x: leftMargin, y, size: 11, font: timesBold });
+    page.drawText(drawableLine(timesBold, data.respondent), { x: leftMargin, y, size: 11, font: timesBold });
     const respWidth = timesBold.widthOfTextAtSize("... RESPONDENT", 11);
     page.drawText("... RESPONDENT", { x: width - rightMargin - respWidth, y, size: 11, font: timesBold });
     y -= 24;

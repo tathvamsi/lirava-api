@@ -1,15 +1,7 @@
-import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { config } from "../../config.js";
-import { getDb } from "../db/index.js";
 import { extractText } from "unpdf";
-const FILES_DIR = path.join(config.dotsDataDir, "files");
-function ensureDir() {
-    if (!fs.existsSync(FILES_DIR)) {
-        fs.mkdirSync(FILES_DIR, { recursive: true });
-    }
-}
+import { pgData } from "../data/pg.js";
 export function guessMime(name) {
     const ext = path.extname(name).toLowerCase();
     const map = {
@@ -35,46 +27,39 @@ export function guessMime(name) {
     };
     return map[ext] || "application/octet-stream";
 }
-export function saveFile(dotId, name, mime, buffer, userId = "") {
-    ensureDir();
-    const db = getDb();
+/** Stores a file for its owner in PostgreSQL and returns the handle used to refer to it. */
+export async function saveFile(vakilId, name, mime, buffer, userId) {
+    if (!userId)
+        throw new Error("A file needs an owner.");
+    const sql = await pgData();
     const id = `file_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const cleanName = name.replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_").slice(0, 120) || "file";
     const resolvedMime = mime && mime !== "application/octet-stream" ? mime : guessMime(cleanName);
-    const now = Date.now();
-    const filePath = path.join(FILES_DIR, id);
-    fs.writeFileSync(filePath, buffer);
-    db.prepare(`
-    INSERT INTO files (id, dot_id, name, mime, size, source, box_path, user_id, created_at)
-    VALUES (?, ?, ?, ?, ?, 'user', NULL, ?, ?)
-  `).run(id, dotId, cleanName, resolvedMime, buffer.length, userId, now);
-    return {
-        id,
-        name: cleanName,
-        mime: resolvedMime,
-        size: buffer.length,
-    };
+    await sql `
+    INSERT INTO app_files (id, user_id, vakil_id, name, mime, size, data, created_at)
+    VALUES (${id}, ${userId}, ${vakilId}, ${cleanName}, ${resolvedMime}, ${buffer.length}, ${buffer}, ${Date.now()})`;
+    return { id, name: cleanName, mime: resolvedMime, size: buffer.length };
 }
-export function getFile(fileId) {
-    ensureDir();
-    const db = getDb();
-    const row = db.prepare("SELECT * FROM files WHERE id = ?").get(fileId);
+/** Returns a file only to the user who uploaded or generated it. */
+export async function getFileForUser(fileId, userId) {
+    if (!userId)
+        return null;
+    const sql = await pgData();
+    const rows = await sql `SELECT id, name, mime, size, data FROM app_files WHERE id = ${fileId} AND user_id = ${userId} LIMIT 1`;
+    const row = rows[0];
     if (!row)
         return null;
-    const filePath = path.join(FILES_DIR, row.id);
-    if (!fs.existsSync(filePath))
-        return null;
-    const data = fs.readFileSync(filePath);
+    const data = Buffer.from(row.data);
     return {
         id: row.id,
         name: row.name,
         mime: row.mime || guessMime(row.name),
-        size: row.size || data.length,
+        size: Number(row.size) || data.length,
         data,
     };
 }
-export async function extractTextFromFile(fileId) {
-    const file = getFile(fileId);
+export async function extractTextFromFile(fileId, userId) {
+    const file = await getFileForUser(fileId, userId);
     if (!file)
         return "";
     const mime = file.mime.toLowerCase();
@@ -103,4 +88,12 @@ export async function extractTextFromFile(fileId) {
         console.warn(`[files] Failed to extract text from file ${fileId} (${file.name}):`, err);
     }
     return "";
+}
+/** Removes several files the user owns in one statement (instead of one delete per file). */
+export async function deleteFilesForUser(fileIds, userId) {
+    if (!userId || fileIds.length === 0)
+        return 0;
+    const sql = await pgData();
+    const rows = await sql `DELETE FROM app_files WHERE user_id = ${userId} AND id = ANY(${fileIds}) RETURNING id`;
+    return rows.length;
 }

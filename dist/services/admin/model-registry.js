@@ -1,61 +1,34 @@
-import { getDb } from "../db/index.js";
 import crypto from "node:crypto";
-export function listModels() {
-    const db = getDb();
-    return db.prepare("SELECT * FROM admin_models ORDER BY created_at DESC").all();
+import { pgData } from "../data/pg.js";
+const toModel = (r) => ({
+    ...r,
+    context_window: Number(r.context_window),
+    disk_size_bytes: Number(r.disk_size_bytes),
+    temperature: Number(r.temperature),
+    top_p: Number(r.top_p),
+});
+export async function listModels() {
+    const sql = await pgData();
+    return (await sql `SELECT * FROM app_models ORDER BY created_at DESC`).map(toModel);
 }
-export function registerModel(data) {
-    const db = getDb();
+export async function registerModel(data) {
+    const sql = await pgData();
     const id = `model-${crypto.randomUUID()}`;
     const now = new Date().toISOString();
-    const record = {
-        id,
-        name: data.name,
-        provider: data.provider || "llama.cpp",
-        gguf_file: data.gguf_file,
-        quantization: data.quantization || "Q4_K_M",
-        context_window: data.context_window || 4096,
-        disk_size_bytes: data.disk_size_bytes || 0,
-        status: "ready",
-        storage_path: data.storage_path,
-        temperature: data.temperature ?? 0.2,
-        top_p: data.top_p ?? 0.85,
-        active_node_id: null,
-        error_message: null,
-        created_at: now,
-        updated_at: now,
-    };
-    db.prepare(`
-    INSERT INTO admin_models (
-      id, name, provider, gguf_file, quantization, context_window, disk_size_bytes,
-      status, storage_path, temperature, top_p, active_node_id, error_message, created_at, updated_at
-    ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-    )
-  `).run(record.id, record.name, record.provider, record.gguf_file, record.quantization, record.context_window, record.disk_size_bytes, record.status, record.storage_path, record.temperature, record.top_p, record.active_node_id ?? null, record.error_message ?? null, record.created_at, record.updated_at);
-    return record;
+    const rows = await sql `
+    INSERT INTO app_models (id, name, provider, gguf_file, quantization, context_window, disk_size_bytes, status, storage_path, temperature, top_p, created_at, updated_at)
+    VALUES (${id}, ${data.name}, ${data.provider || "llama.cpp"}, ${data.gguf_file}, ${data.quantization || "Q4_K_M"}, ${data.context_window || 4096},
+            ${data.disk_size_bytes || 0}, 'ready', ${data.storage_path}, ${data.temperature ?? 0.2}, ${data.top_p ?? 0.85}, ${now}, ${now})
+    RETURNING *`;
+    return toModel(rows[0]);
 }
-export function loadModel(modelId, nodeId) {
-    const db = getDb();
-    const model = db.prepare("SELECT * FROM admin_models WHERE id = ?").get(modelId);
-    if (!model)
-        return { success: false, error: "Model not found" };
-    db.prepare(`
-    UPDATE admin_models
-    SET status = 'loaded', active_node_id = ?, updated_at = ?
-    WHERE id = ?
-  `).run(nodeId, new Date().toISOString(), modelId);
-    return { success: true };
+export async function loadModel(modelId, nodeId) {
+    const sql = await pgData();
+    const rows = await sql `UPDATE app_models SET status = 'loaded', active_node_id = ${nodeId}, updated_at = ${new Date().toISOString()} WHERE id = ${modelId} RETURNING id`;
+    return rows.length ? { success: true } : { success: false, error: "Model not found" };
 }
-export function unloadModel(modelId) {
-    const db = getDb();
-    const model = db.prepare("SELECT * FROM admin_models WHERE id = ?").get(modelId);
-    if (!model)
-        return { success: false, error: "Model not found" };
-    db.prepare(`
-    UPDATE admin_models
-    SET status = 'ready', active_node_id = NULL, updated_at = ?
-    WHERE id = ?
-  `).run(new Date().toISOString(), modelId);
-    return { success: true };
+export async function unloadModel(modelId) {
+    const sql = await pgData();
+    const rows = await sql `UPDATE app_models SET status = 'ready', active_node_id = NULL, updated_at = ${new Date().toISOString()} WHERE id = ${modelId} RETURNING id`;
+    return rows.length ? { success: true } : { success: false, error: "Model not found" };
 }
