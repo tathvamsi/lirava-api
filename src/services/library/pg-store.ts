@@ -155,6 +155,9 @@ const toJudgmentCase = (r: JudgmentRow): LibraryCase => ({
   para_count: 0,
 });
 
+let heldActs: Set<string> | null = null;
+let heldActsAt = 0;
+
 export class PgLibraryStore implements LibraryStore {
   async findCases(key: string): Promise<LibraryCase[]> {
     await ensureSchema();
@@ -191,6 +194,25 @@ export class PgLibraryStore implements LibraryStore {
     const sql = getSql();
     if (!sql) return [];
     return sql<CasePara[]>`SELECT case_id, para_no, text FROM library_case_paras WHERE case_id = ${caseId} ORDER BY seq`;
+  }
+
+  /** Which Acts have at least one section loaded (in either statute table). Cached briefly: it changes only when an Act is ingested. */
+  async holdsAct(actCode: string): Promise<boolean> {
+    const sql = getSql();
+    if (!sql) return true; // cannot tell, so do not claim the Act is missing
+    const now = Date.now();
+    if (!heldActs || now - heldActsAt > 60_000) {
+      try {
+        await ensureSchema();
+        const loaded = await sql<Array<{ code: string }>>`SELECT DISTINCT UPPER(act_code) AS code FROM library_provisions`;
+        const seeds = await sql<Array<{ code: string }>>`SELECT DISTINCT UPPER(act_code) AS code FROM legal_provisions`;
+        heldActs = new Set([...loaded, ...seeds].map((r) => r.code.replace(/_\d{4}$/, "")));
+        heldActsAt = now;
+      } catch {
+        return true;
+      }
+    }
+    return heldActs.has(actCode.toUpperCase());
   }
 
   async findProvision(actCode: string, sectionNum: string): Promise<LibraryProvision | null> {

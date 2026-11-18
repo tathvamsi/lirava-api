@@ -132,7 +132,59 @@ describe("verifying citations against the library", () => {
   it("never verifies a plausible citation that is not in the library", async () => {
     const [v] = await only("See (2019) 7 SCC 999.");
     assert.equal(v.status, "unverified");
-    assert.equal(v.reason, "not_in_library");
+    assert.equal(v.reason, "not_covered", "the library holds no SCC citations beyond the few it has, so it says so rather than implying the case is fake");
+    assert.match(v.warning ?? "", /does not hold SCC citations yet/);
+    assert.doesNotMatch(v.warning ?? "", /fake|false|invalid/i);
+  });
+
+  it("labels every form of citation the source does not hold as not covered, never verified", async () => {
+    const cases: Array<[string, RegExp]> = [
+      ["AIR 2019 SC 1234", /AIR/],
+      ["A.I.R. 2019 S.C. 1234", /AIR/],
+      ["2019 SCC OnLine Del 456", /SCC OnLine/],
+      ["(2019) 5 SCALE 12", /SCALE/],
+      ["2019:DHC:2720", /High Court neutral/],
+    ];
+    for (const [text, label] of cases) {
+      const [v] = await only(`See ${text}.`);
+      assert.equal(v.status, "unverified", text);
+      assert.equal(v.reason, "not_covered", text);
+      assert.match(v.warning ?? "", label, text);
+    }
+  });
+
+  it("still verifies a not-covered kind when a record does carry that key", async () => {
+    const [v] = await only("State of Haryana v. Bhajan Lal, AIR 1992 SC 604.");
+    assert.equal(v.status, "verified");
+  });
+
+  it("keeps not_in_library for the kinds it does cover: an invented SCR or INSC number", async () => {
+    const [scr] = await only("See [2019] 7 S.C.R. 999.");
+    assert.equal(scr.reason, "not_in_library");
+    const [insc] = await only("See 2019 INSC 99999.");
+    assert.equal(insc.reason, "not_in_library");
+  });
+
+  it("separates an Act the library does not hold from a missing section of an Act it holds", async () => {
+    const [heldAct] = await only("Section 999 IPC.");
+    assert.equal(heldAct.reason, "not_in_library");
+    const [unheld] = await only("Section 41 CrPC.");
+    assert.equal(unheld.status, "unverified");
+    assert.equal(unheld.reason, "not_covered");
+    assert.match(unheld.warning ?? "", /does not hold the text of CRPC/);
+  });
+
+  it("keeps the date warning and adds the coverage note for an unloaded Act", async () => {
+    const [v] = await only("Section 41 CrPC.", "2025-01-01");
+    assert.equal(v.reason, "not_covered");
+    assert.match(v.warning ?? "", /1 July 2024/);
+    assert.match(v.warning ?? "", /does not hold the text of CRPC/);
+  });
+
+  it("falls back to not_in_library when the store cannot say which Acts it holds", async () => {
+    const bare = { findCases: async () => [], getCase: async () => null, getParas: async () => [], findProvision: async () => null };
+    const { verdicts } = await verifyAnswer("Section 41 CrPC.", bare);
+    assert.equal(verdicts[0].reason, "not_in_library");
   });
 
   it("flags a real citation attached to the wrong case name", async () => {

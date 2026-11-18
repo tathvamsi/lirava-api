@@ -12,7 +12,10 @@ export type CheckLevel = "citation" | "quote";
 
 export type CiteReason =
   | "ok"
+  /** The library covers this kind of citation and has no such record. */
   | "not_in_library"
+  /** The library does not hold this kind of citation at all (for example SCC or AIR, or an Act whose text is not loaded), so it can say nothing either way. */
+  | "not_covered"
   | "ambiguous"
   | "title_mismatch"
   | "quote_not_found"
@@ -63,6 +66,11 @@ export interface LibraryStore {
   getCase(id: string): Promise<LibraryCase | null>;
   getParas(caseId: string): Promise<CasePara[]>;
   findProvision(actCode: string, sectionNum: string): Promise<LibraryProvision | null>;
+  /**
+   * Whether any section of this Act is loaded. Optional: a store that cannot say leaves it out, and a missing section
+   * of such an Act is then reported as "not_in_library", as before. When it returns false the verdict is "not_covered".
+   */
+  holdsAct?(actCode: string): Promise<boolean>;
 }
 
 export interface CiteVerdict {

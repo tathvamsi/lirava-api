@@ -34,6 +34,10 @@ export class MemoryLibraryStore implements LibraryStore {
   async getParas(caseId: string) {
     return this.paras.get(caseId) ?? [];
   }
+  async holdsAct(actCode: string) {
+    const code = actCode.toUpperCase();
+    return [...this.provisions.values()].some((p) => p.act_code.toUpperCase() === code);
+  }
   async findProvision(actCode: string, sectionNum: string) {
     return this.provisions.get(`${actCode.toUpperCase()}:${sectionNum.toUpperCase()}`) ?? null;
   }
