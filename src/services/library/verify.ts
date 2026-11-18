@@ -1,4 +1,5 @@
 import { canonicalKey, extractCitations } from "./cite-parse.js";
+import { equivalenceProblem, findEquivalenceClaims } from "./equivalence.js";
 import { findQuote } from "./text-match.js";
 import type { CiteVerdict, LibraryStore, ParsedCite, VerifyResult } from "./types.js";
 
@@ -194,6 +195,18 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
     }
 
     verdicts.push({ ...found, status: "verified", reason: "ok", level: "citation", ...(citedPara ? { para: citedPara } : {}), ...(nameNote ? { warning: nameNote } : {}) });
+  }
+
+  // "Section 482 BNSS (now Section 482 CrPC)": both sections may exist, but the claim that they are the same provision may be false.
+  // One verdict was pushed per citation, in order, so a position in `cites` is the same position in `verdicts`.
+  for (const claim of findEquivalenceClaims(text, cites)) {
+    const a = cites[claim.first];
+    const b = cites[claim.second];
+    const va = verdicts[claim.first];
+    const vb = verdicts[claim.second];
+    if (a.kind !== "statute" || b.kind !== "statute" || !va || !vb || va.status !== "verified" || vb.status !== "verified") continue;
+    const problem = equivalenceProblem({ cite: a, title: va.library_title }, { cite: b, title: vb.library_title });
+    if (problem) verdicts[claim.second] = { ...vb, status: "partial", reason: "equivalence_mismatch", level: undefined, warning: `The text presents these as the same provision, but they are not: ${problem}` };
   }
 
   const counts = { verified: 0, partial: 0, unverified: 0 };

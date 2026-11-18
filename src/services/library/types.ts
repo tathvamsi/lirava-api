@@ -16,6 +16,8 @@ export type CiteReason =
   | "not_in_library"
   /** The library does not hold this kind of citation at all (for example SCC or AIR, or an Act whose text is not loaded), so it can say nothing either way. */
   | "not_covered"
+  /** The text says two sections are the same provision (old law and new law), but they are not. */
+  | "equivalence_mismatch"
   | "ambiguous"
   | "title_mismatch"
   | "quote_not_found"

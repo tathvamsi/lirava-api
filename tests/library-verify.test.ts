@@ -522,3 +522,43 @@ describe("Constitution articles, the SC/ST Act, sub-clauses and CPC orders", () 
     assert.equal(sec.status, "verified");
   });
 });
+
+describe("claims that an old section and a new section are the same provision", () => {
+  const store = new MemoryLibraryStore()
+    .addProvision({ id: "bnss-482", act_code: "BNSS", section_num: "482", title: "Direction for grant of bail to person apprehending arrest" })
+    .addProvision({ id: "bnss-483", act_code: "BNSS", section_num: "483", title: "Special powers of High Court or Court of Session regarding bail" })
+    .addProvision({ id: "crpc-482", act_code: "CRPC", section_num: "482", title: "Saving of inherent powers of High Court" })
+    .addProvision({ id: "crpc-438", act_code: "CRPC", section_num: "438", title: "Direction for grant of bail to person apprehending arrest" })
+    .addProvision({ id: "bns-103", act_code: "BNS", section_num: "103", title: "Punishment for murder" })
+    .addProvision({ id: "ipc-302", act_code: "IPC", section_num: "302", title: "Punishment for murder" })
+    .addProvision({ id: "ipc-420", act_code: "IPC", section_num: "420", title: "Cheating and dishonestly inducing delivery of property" })
+    .addProvision({ id: "bns-318", act_code: "BNS", section_num: "318", title: "Cheating" });
+  const check = async (text: string) => (await verifyAnswer(text, store)).verdicts;
+
+  it("flags the claim that Section 482 BNSS is now Section 482 CrPC (the answer a real test produced)", async () => {
+    const [a, b] = await check("The Magistrate may act under Section 482 BNSS (now Section 482 CrPC).");
+    assert.equal(a.status, "verified");
+    assert.equal(b.status, "partial");
+    assert.equal(b.reason, "equivalence_mismatch");
+    assert.match(b.warning ?? "", /not the same provision|different provisions|replaced|became/);
+    assert.match(b.warning ?? "", /Section 482|CrPC 482|BNSS 482/);
+  });
+
+  it("leaves a correct pairing alone, in either order and with different wording", async () => {
+    for (const t of ["Section 482 BNSS (earlier Section 438 CrPC) deals with anticipatory bail.", "Section 438 CrPC, now Section 482 BNSS, deals with anticipatory bail.", "Section 103 BNS (formerly Section 302 IPC) punishes murder.", "Section 318 BNS, which replaced Section 420 IPC, punishes cheating."]) {
+      const verdicts = await check(t);
+      assert.deepEqual(verdicts.map((v) => v.status), ["verified", "verified"], t);
+    }
+  });
+
+  it("flags a pairing that contradicts a known mapping even when the titles overlap", async () => {
+    const [, b] = await check("Section 438 CrPC (now Section 483 BNSS) deals with anticipatory bail.");
+    assert.equal(b.reason, "equivalence_mismatch");
+    assert.match(b.warning ?? "", /became BNSS 482/);
+  });
+
+  it("does not treat two sections that are merely mentioned together as a claim of equivalence", async () => {
+    const verdicts = await check("Section 482 BNSS and Section 482 CrPC are both mentioned in the order.");
+    assert.deepEqual(verdicts.map((v) => v.status), ["verified", "verified"]);
+  });
+});
