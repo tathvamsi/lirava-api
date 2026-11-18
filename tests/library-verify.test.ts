@@ -500,6 +500,20 @@ describe("Constitution articles, the SC/ST Act, sub-clauses and CPC orders", () 
     }
   });
 
+  it("tells the reader when a citation was learned from the Court's printed parallel citation", async () => {
+    const learned = new MemoryLibraryStore().addCase(
+      { id: "scj:goa", title: "STATE OF GOA v. SANJAY THAKRAN", court: "Supreme Court of India", year: 2007, citation_text: "[2007] 3 S.C.R. 507", matched_via: "parallel" },
+      ["[2007] 3 S.C.R. 507", "(2007) 3 SCC 755"],
+    );
+    const [v] = (await verifyAnswer("State of Goa v. Sanjay Thakran, (2007) 3 SCC 755.", learned)).verdicts;
+    assert.equal(v.status, "verified");
+    assert.match(v.warning ?? "", /parallel citation the Court prints/);
+    assert.match(v.warning ?? "", /\[2007\] 3 S\.C\.R\. 507/);
+    const [wrong] = (await verifyAnswer("Arnesh Kumar v. State of Bihar, (2007) 3 SCC 755.", learned)).verdicts;
+    assert.equal(wrong.status, "partial", "a learned citation is still checked against the case name");
+    assert.equal(wrong.reason, "title_mismatch");
+  });
+
   it("says CPC Orders and Rules cannot be checked, rather than that they are missing", async () => {
     const [v] = await check("Order XXXIX Rule 1 CPC");
     assert.equal(v.status, "unverified");

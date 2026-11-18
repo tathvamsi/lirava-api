@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS library_cite_keys (
   case_id TEXT NOT NULL,
   PRIMARY KEY (key, case_id)
 );
+-- NULL = a citation the record itself carries. "parallel" = learned from a parallel citation the Court printed beside it.
+ALTER TABLE library_cite_keys ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE library_cite_keys ADD COLUMN IF NOT EXISTS sightings INT;
 CREATE INDEX IF NOT EXISTS library_cite_keys_case_idx ON library_cite_keys (case_id);
 
 CREATE TABLE IF NOT EXISTS library_case_paras (
@@ -141,6 +144,8 @@ interface JudgmentRow {
   neutral_citation: string | null;
   scr_citation: string | null;
   languages: string | null;
+  /** Where the matching citation key came from: null = the record's own, "parallel" = learned from the Court's printed parallel citations. */
+  via?: string | null;
 }
 
 // No paragraphs are stored for these, so the verifier can confirm the citation and the case name but not a quotation.
@@ -152,6 +157,7 @@ const toJudgmentCase = (r: JudgmentRow): LibraryCase => ({
   citation_text: [r.scr_citation, r.neutral_citation].filter(Boolean).join("; "),
   source_url: null,
   languages: r.languages ? r.languages.split(",") : [],
+  ...(r.via === "parallel" ? { matched_via: "parallel" as const } : {}),
   para_count: 0,
 });
 
@@ -169,7 +175,7 @@ export class PgLibraryStore implements LibraryStore {
       FROM library_cite_keys k JOIN legal_cases c ON c.id = k.case_id
       WHERE k.key = ${key}`;
     const judgments = await sql<JudgmentRow[]>`
-      SELECT j.id, j.title, j.court, j.year, j.neutral_citation, j.scr_citation, j.languages
+      SELECT j.id, j.title, j.court, j.year, j.neutral_citation, j.scr_citation, j.languages, k.source AS via
       FROM library_cite_keys k JOIN library_judgments j ON j.id = k.case_id
       WHERE k.key = ${key}`;
     return [...rows.map(toCase), ...judgments.map(toJudgmentCase)];

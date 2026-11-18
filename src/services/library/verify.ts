@@ -148,10 +148,13 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
     }
 
     // A case name written in another script cannot be compared with the record's English title. Say so, and show the record.
-    const nameNote =
+    const scriptNote =
       !named && INDIC_LETTERS.test(text.slice(Math.max(prevEnd, cite.span[0] - 120), cite.span[0]))
         ? `The case name was written in another script, so it was not compared with the record. The library lists this citation as "${record.title}".`
         : null;
+    // A citation the library learned from the Court's own printed parallel citations (an SCC or AIR number beside the SCR one).
+    const parallelNote = record.matched_via === "parallel" ? `Matched through the parallel citation the Court prints beside this case. The library's own citation for it is ${record.citation_text}.` : null;
+    const nameNote = [scriptNote, parallelNote].filter(Boolean).join(" ") || null;
 
     const quote = quoteNear(text, [prevEnd, cite.span[0]], [cite.span[1], nextStart]);
     const citedPara = paraNear(paraCites, cite.span[0], cite.span[1], nextStart);

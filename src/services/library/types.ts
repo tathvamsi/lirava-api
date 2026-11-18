@@ -38,6 +38,11 @@ export interface LibraryCase {
   source_url?: string | null;
   /** Languages the Court officially publishes this judgment in, as its own codes (ENG, HIN, MAR, KAN, TAM, TEL ...). Empty when unknown. */
   languages?: string[];
+  /**
+   * Set when this record was found through a citation the library learned from the Court's own printed parallel citations
+   * (for example an SCC number printed beside the SCR number), not from the record's own metadata.
+   */
+  matched_via?: "parallel";
   /** Number of numbered paragraphs held. 0 means only the record is in the library, not the judgment text. */
   para_count: number;
 }
