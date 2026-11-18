@@ -365,6 +365,27 @@ export async function findDuplicateArtifact(userId: string, conversationId: stri
   return rows[0] ? toArtifact(rows[0]) : null;
 }
 
+/** The user's edit of their own document or plan: new text (and title), and the fresh PDF when there is one. */
+export async function updateArtifactForUser(
+  id: string,
+  userId: string,
+  changes: { title?: string; content?: string; pdfFileId?: string | null; metadata?: any },
+): Promise<DocumentArtifact | null> {
+  if (!userId) return null;
+  const sql = await pgData();
+  const rows = await sql`
+    UPDATE app_artifacts SET
+      title = COALESCE(${changes.title ?? null}, title),
+      content = COALESCE(${changes.content ?? null}, content),
+      pdf_file_id = COALESCE(${changes.pdfFileId ?? null}, pdf_file_id),
+      metadata = COALESCE(${changes.metadata ? sql.json(changes.metadata) : null}, metadata),
+      updated_at = ${Date.now()}
+    WHERE id = ${id} AND user_id = ${userId}
+    RETURNING *`;
+  // No "artifact" event here: the store opens the panel on that event, and an edit must not reopen a closed one.
+  return rows[0] ? toArtifact(rows[0]) : null;
+}
+
 export async function saveArtifact(data: {
   vakilId: string;
   conversationId?: string | null;

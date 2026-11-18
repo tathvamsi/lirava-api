@@ -1,5 +1,6 @@
 import { searchStatutes } from "./qdrant.js";
 import { searchProvisions } from "./provisions.js";
+import { searchCases } from "./cases.js";
 
 export interface RetrievedLegalContext {
   documentTitle?: string;
@@ -14,6 +15,7 @@ export interface RetrievedLegalContext {
 }
 
 interface Candidate {
+  entityType: "provision" | "precedent";
   act: string;
   section: string;
   title: string;
@@ -23,74 +25,139 @@ interface Candidate {
   score: number;
 }
 
-const MIN_VECTOR_SCORE = 0.42;
-const MAX_PROVISIONS = 4;
+const MIN_VECTOR_SCORE = 0.35;
+const MAX_CANDIDATES = 4;
 
 /**
- * Statute retrieval. Two searches run side by side and are merged:
- *  1. semantic search in Qdrant (needs the embedding server), and
- *  2. full-text search over the provisions stored in PostgreSQL (always available, including the
- *     Acts an administrator has loaded).
- * Either may fail or find nothing; the other still answers. Returns null, never an error, when
- * nothing relevant is found, so callers can say so instead of guessing.
+ * Hybrid retrieval engine. Executes semantic vector search in Qdrant and lexical full-text
+ * search across PostgreSQL legal provisions and landmark cases in parallel.
+ * Results are deduplicated and formatted into authoritative courtroom context under a length budget.
+ * Gracefully degrades if either Qdrant or PostgreSQL is offline.
  */
 export async function retrieveLegalContext(query: string, maxChars = 1400): Promise<RetrievedLegalContext | null> {
   const trimmed = query.trim();
   if (!trimmed) return null;
 
-  const [vector, text] = await Promise.allSettled([searchStatutes(trimmed, 3), searchProvisions(trimmed, MAX_PROVISIONS)]);
+  const [vectorResult, provisionsResult, casesResult] = await Promise.allSettled([
+    searchStatutes(trimmed, 4),
+    searchProvisions(trimmed, MAX_CANDIDATES),
+    searchCases(trimmed, 2),
+  ]);
 
   const candidates: Candidate[] = [];
-  if (vector.status === "fulfilled") {
-    for (const r of vector.value) {
+
+  // 1. Process dense semantic vector hits from Qdrant
+  if (vectorResult.status === "fulfilled") {
+    for (const r of vectorResult.value) {
       if (r.score < MIN_VECTOR_SCORE || !r.payload) continue;
+      const p = r.payload;
+      const isPrecedent =
+        p.entity_type === "precedent" ||
+        (p.act && p.act.toLowerCase().includes("precedent")) ||
+        p.category === "judicial_precedent";
+
       candidates.push({
-        act: r.payload.act || "Statute",
-        section: r.payload.section || "Section",
-        title: r.payload.title || "",
-        text: r.payload.statutoryText || r.payload.text || "",
-        ratio: r.payload.ratio,
-        source: r.payload.source,
+        entityType: isPrecedent ? "precedent" : "provision",
+        act: p.act || (isPrecedent ? "Supreme Court of India Precedent" : "Statute"),
+        section: p.section || (isPrecedent ? (p.primary_citation || "") : "Section"),
+        title: p.title || p.case_title || "",
+        text: p.statutoryText || p.text || "",
+        ratio: p.ratio,
+        source: p.source,
         score: r.score,
       });
     }
   }
-  if (text.status === "fulfilled") {
-    for (const r of text.value) {
-      candidates.push({ act: r.act, section: r.section, title: r.title, text: r.text, ratio: r.ratio, source: r.source, score: 0.5 });
+
+  // 2. Process lexical FTS provisions from PostgreSQL
+  if (provisionsResult.status === "fulfilled") {
+    for (const r of provisionsResult.value) {
+      candidates.push({
+        entityType: "provision",
+        act: r.act,
+        section: r.section,
+        title: r.title,
+        text: r.text,
+        ratio: r.ratio,
+        source: r.source,
+        score: (r as any).rank ? Math.min(0.5 + (r as any).rank * 0.1, 0.95) : 0.5,
+      });
     }
   } else {
-    console.warn("[legal-rag] provision search failed:", (text.reason as Error)?.message);
+    console.warn("[legal-rag] provision search failed:", (provisionsResult.reason as Error)?.message);
   }
 
-  // The same provision can come from both searches: keep one copy, preferring the semantic match.
+  // 3. Process lexical FTS cases from PostgreSQL
+  if (casesResult.status === "fulfilled") {
+    for (const c of casesResult.value) {
+      candidates.push({
+        entityType: "precedent",
+        act: c.court || "Supreme Court of India",
+        section: c.primary_citation,
+        title: `${c.case_title}, ${c.primary_citation}`,
+        text: c.ratio + (c.principles && c.principles.length ? `\nPrinciples: ${c.principles.join("; ")}` : ""),
+        ratio: c.ratio,
+        source: c.neutral_citation
+          ? `Judicial Citation: ${c.primary_citation} / ${c.neutral_citation}`
+          : `Judicial Citation: ${c.primary_citation}`,
+        score: 0.5,
+      });
+    }
+  }
+
+  // 4. Deduplicate candidates (preferring earlier vector hits)
   const seen = new Set<string>();
   const unique = candidates.filter((c) => {
-    const key = `${c.act}|${c.section}`.toLowerCase();
+    let key = "";
+    if (c.entityType === "precedent") {
+      key = `case:${c.title || c.section}`.toLowerCase().replace(/[^a-z0-9]/g, "");
+    } else {
+      key = `prov:${c.act}|${c.section}`.toLowerCase().replace(/[^a-z0-9|]/g, "");
+    }
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+
   if (!unique.length) return null;
 
-  const chosen = unique.slice(0, MAX_PROVISIONS);
-  const parts = chosen.map((c) =>
-    [
+  const chosen = unique.slice(0, MAX_CANDIDATES);
+  const parts = chosen.map((c) => {
+    if (c.entityType === "precedent") {
+      return [
+        `[JUDICIAL PRECEDENT]: ${c.title || c.act}`,
+        c.ratio ? `JUDICIAL RATIO / CORE PRINCIPLE: ${c.ratio}` : "",
+        c.text ? `DETAILS: ${c.text}` : "",
+        c.source ? `SOURCE: ${c.source}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    return [
       `[PROVISION]: ${c.act} - ${c.section}${c.title ? `: ${c.title}` : ""}`,
       c.text ? `TEXT: ${c.text}` : "",
       c.ratio ? `JUDICIAL RATIO / CORE PRINCIPLE: ${c.ratio}` : "",
       c.source ? `SOURCE: ${c.source}` : "",
     ]
       .filter(Boolean)
-      .join("\n"),
-  );
+      .join("\n");
+  });
 
   let contextText = `### STATUTORY PROVISIONS (from Lirava's statute library; verify against the official text before relying on them):\n${parts.join("\n\n---\n\n")}`;
-  if (contextText.length > maxChars) contextText = contextText.slice(0, maxChars) + "\n...[truncated for length]";
+  if (contextText.length > maxChars) {
+    contextText = contextText.slice(0, maxChars) + "\n...[truncated for length]";
+  }
 
   return {
     documentTitle: chosen[0].act || "Statutory Legal Corpus",
     contextText,
-    sources: chosen.map((c) => ({ act: c.act, section: c.section, title: c.title, score: c.score, source: c.source ?? undefined })),
+    sources: chosen.map((c) => ({
+      act: c.act,
+      section: c.section,
+      title: c.title,
+      score: c.score,
+      source: c.source ?? undefined,
+    })),
   };
 }

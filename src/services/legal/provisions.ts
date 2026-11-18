@@ -6,32 +6,55 @@
  */
 import { getSql } from "../db/postgres.js";
 import { ensureEnglishTsv } from "../db/fts.js";
-import { withSchemaLock } from "../db/schema-lock.js";
+import { withSchemaLock, LEGAL_SCHEMA_LOCK_KEY } from "../db/schema-lock.js";
 import { searchTerms } from "../documents/index.js";
+import {
+  splitIntoSections,
+  parseCpcOrders,
+  parseBareAct,
+  extractStructuralElements,
+  type SectionDraft,
+  type ParsedProvision,
+  type ParseOptions,
+} from "./parser.js";
 
-export interface SectionDraft {
-  section: string; // e.g. "483" or "438A"
-  title: string;
-  text: string;
-}
+export {
+  splitIntoSections,
+  parseCpcOrders,
+  parseBareAct,
+  extractStructuralElements,
+  type SectionDraft,
+  type ParsedProvision,
+  type ParseOptions,
+};
 
-export interface ProvisionHit {
+export interface LegalProvisionRow {
   id: string;
   act: string;
+  act_code?: string;
   section: string;
+  section_num?: string;
   title: string;
   text: string;
   ratio?: string | null;
   source?: string | null;
   year?: number | null;
-  rank: number;
+  category?: string | null;
+  document_id?: string | null;
+  created_at: number;
+  indexed_at?: number | null;
+  rank?: number;
 }
+
+export type ProvisionHit = LegalProvisionRow;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS legal_provisions (
   id          TEXT PRIMARY KEY,
   act         TEXT NOT NULL,
+  act_code    TEXT,
   section     TEXT NOT NULL,
+  section_num TEXT,
   title       TEXT NOT NULL DEFAULT '',
   text        TEXT NOT NULL,
   ratio       TEXT,
@@ -40,16 +63,38 @@ CREATE TABLE IF NOT EXISTS legal_provisions (
   category    TEXT,
   document_id TEXT,
   created_at  BIGINT NOT NULL,
+  indexed_at  BIGINT,
   tsv         TSVECTOR GENERATED ALWAYS AS (
     setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(section, '') || ' ' || coalesce(act, '')), 'B') ||
-    setweight(to_tsvector('english', coalesce(text, '')), 'C')
+    setweight(to_tsvector('english', coalesce(section, '') || ' ' || coalesce(act_code, '') || ' ' || coalesce(act, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(text, '') || ' ' || coalesce(ratio, '')), 'C')
   ) STORED
 );
-CREATE INDEX IF NOT EXISTS legal_provisions_tsv_idx ON legal_provisions USING GIN (tsv);
-CREATE INDEX IF NOT EXISTS legal_provisions_document_idx ON legal_provisions (document_id);
+ALTER TABLE legal_provisions ADD COLUMN IF NOT EXISTS act_code TEXT;
+ALTER TABLE legal_provisions ADD COLUMN IF NOT EXISTS section_num TEXT;
 ALTER TABLE legal_provisions ADD COLUMN IF NOT EXISTS indexed_at BIGINT;
+CREATE INDEX IF NOT EXISTS legal_provisions_tsv_idx ON legal_provisions USING GIN (tsv);
+CREATE INDEX IF NOT EXISTS legal_provisions_act_code_sec_idx ON legal_provisions (act_code, section_num);
+CREATE INDEX IF NOT EXISTS legal_provisions_document_idx ON legal_provisions (document_id);
 CREATE INDEX IF NOT EXISTS legal_provisions_act_idx ON legal_provisions (act);
+
+UPDATE legal_provisions
+SET act_code = CASE
+  WHEN act ILIKE '%Nagarik Suraksha%' OR act ILIKE '%BNSS%' THEN 'BNSS'
+  WHEN act ILIKE '%Nyaya Sanhita%' OR act ILIKE '%BNS%' THEN 'BNS'
+  WHEN act ILIKE '%Sakshya%' OR act ILIKE '%BSA%' THEN 'BSA'
+  WHEN act ILIKE '%Civil Procedure%' OR act ILIKE '%CPC%' THEN 'CPC'
+  WHEN act ILIKE '%Criminal Procedure%' OR act ILIKE '%CrPC%' THEN 'CRPC'
+  WHEN act ILIKE '%Penal Code%' OR act ILIKE '%IPC%' THEN 'IPC'
+  WHEN act ILIKE '%Contract%' OR act ILIKE '%ICA%' THEN 'ICA'
+  WHEN act ILIKE '%Negotiable%' OR act ILIKE '%NIA%' THEN 'NIA'
+  ELSE UPPER(SPLIT_PART(act, ' ', 1))
+END
+WHERE act_code IS NULL;
+
+UPDATE legal_provisions
+SET section_num = REGEXP_REPLACE(section, '^(Order\\s+[A-Z0-9]+\\s+Rule\\s+[A-Z0-9]+|Section\\s+)', '', 'i')
+WHERE section_num IS NULL;
 `;
 
 let ready: Promise<void> | null = null;
@@ -57,68 +102,37 @@ async function pg() {
   const sql = getSql();
   if (!sql) throw new Error("DATABASE_URL is not configured.");
   if (!ready) {
-    ready = withSchemaLock(sql, async (tx) => {
-      await tx.unsafe(SCHEMA);
-      await ensureEnglishTsv(
-        tx,
-        "legal_provisions",
-        `setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(section, '') || ' ' || coalesce(act, '')), 'B') ||
-    setweight(to_tsvector('english', coalesce(text, '')), 'C')`,
-      );
-    })
-      .catch((err) => {
-        ready = null;
-        throw err;
-      });
+    ready = withSchemaLock(
+      sql,
+      async (tx) => {
+        await tx.unsafe(SCHEMA);
+        await ensureEnglishTsv(
+          tx,
+          "legal_provisions",
+          `setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(section, '') || ' ' || coalesce(act_code, '') || ' ' || coalesce(act, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(text, '') || ' ' || coalesce(ratio, '')), 'C')`,
+        );
+      },
+      LEGAL_SCHEMA_LOCK_KEY,
+    ).catch((err) => {
+      ready = null;
+      throw err;
+    });
   }
   await ready;
   return sql;
 }
 
-const slug = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
-
-/**
- * Splits the text of an Act into its sections. Indian Acts number their sections in order
- * ("483. Special powers of High Court ... —", "483A. ..."), so a line that starts a new section is one
- * beginning with the next plausible number. Chapter headings and page furniture between sections are dropped.
- */
-export function splitIntoSections(raw: string): SectionDraft[] {
-  const lines = raw.replace(/\r\n?/g, "\n").split("\n").map((line) => line.trim());
-  const starts: Array<{ index: number; section: string; rest: string }> = [];
-  let last = 0;
-
-  lines.forEach((line, index) => {
-    const m = /^(\d{1,3})([A-Z]{0,2})\s*[.)]\s+(\S.*)$/.exec(line);
-    if (!m) return;
-    const n = Number(m[1]);
-    // A new section is the next number, or a small step ahead (repealed sections can be skipped); a lettered
-    // insertion such as 438A keeps the same number. Anything else is a numbered list inside a section.
-    const isNext = n === last + 1 || (n > last && n <= last + 5) || (m[2] && n === last);
-    if (!isNext && last !== 0) return;
-    if (last === 0 && n > 3) return; // an Act starts at section 1 (or very near it)
-    last = Math.max(last, n);
-    starts.push({ index, section: `${m[1]}${m[2]}`, rest: m[3] });
-  });
-
-  const sections: SectionDraft[] = [];
-  starts.forEach((start, i) => {
-    const end = i + 1 < starts.length ? starts[i + 1].index : lines.length;
-    const body = [start.rest, ...lines.slice(start.index + 1, end)]
-      .filter((l) => l && !/^(CHAPTER\s+[IVXLC\d]+|PART\s+[IVXLC\d]+|\d+\s*$)/i.test(l))
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (body.length < 12) return;
-    // The heading is the opening phrase, up to the first full stop or dash.
-    const heading = /^(.{3,200}?)(?:\.\s*[—–-]|\.\s|\s[—–-]\s|$)/.exec(body)?.[1] ?? body.slice(0, 120);
-    sections.push({ section: start.section, title: heading.trim().replace(/[.:—–-]+$/, ""), text: body });
-  });
-  return sections;
+export async function ensureLegalProvisionsSchema(): Promise<void> {
+  await pg();
 }
+
+const slug = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
 
 export async function upsertProvisions(input: {
   act: string;
+  actCode?: string | null;
   year?: number | null;
   source?: string | null;
   category?: string | null;
@@ -129,9 +143,11 @@ export async function upsertProvisions(input: {
   const sql = await pg();
   const now = Date.now();
   const rows = input.sections.map((s) => ({
-    id: `${slug(input.act)}-sec-${s.section.toLowerCase()}`,
+    id: `${slug(input.act)}-sec-${s.section.toLowerCase().replace(/\s+/g, "-")}`,
     act: input.act,
-    section: `Section ${s.section}`,
+    act_code: input.actCode ?? null,
+    section: /^(Order|Section|Schedule)\b/i.test(s.section) ? s.section : `Section ${s.section}`,
+    section_num: s.section.replace(/^(Order\s+[A-Z0-9]+\s+Rule\s+[A-Z0-9]+|Section\s+)/i, "").trim(),
     title: s.title,
     text: s.text,
     source: input.source ?? null,
@@ -143,9 +159,11 @@ export async function upsertProvisions(input: {
   for (let i = 0; i < rows.length; i += 100) {
     const batch = rows.slice(i, i + 100);
     await sql`
-      INSERT INTO legal_provisions ${sql(batch, "id", "act", "section", "title", "text", "source", "year", "category", "document_id", "created_at")}
+      INSERT INTO legal_provisions ${sql(batch, "id", "act", "act_code", "section", "section_num", "title", "text", "source", "year", "category", "document_id", "created_at")}
       ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, text = EXCLUDED.text, source = EXCLUDED.source,
         year = EXCLUDED.year, category = EXCLUDED.category, document_id = EXCLUDED.document_id,
+        act_code = COALESCE(EXCLUDED.act_code, legal_provisions.act_code),
+        section_num = COALESCE(EXCLUDED.section_num, legal_provisions.section_num),
         indexed_at = CASE WHEN legal_provisions.text = EXCLUDED.text AND legal_provisions.title = EXCLUDED.title THEN legal_provisions.indexed_at ELSE NULL END`;
   }
   return rows.length;
@@ -153,14 +171,26 @@ export async function upsertProvisions(input: {
 
 /** Stores the built-in starter provisions (once; existing rows, including ones an administrator replaced, are kept). */
 export async function seedBuiltInProvisions(
-  items: Array<{ id: string; act: string; section: string; title: string; statutoryText: string; ratio?: string; source: string; year?: number; category: string }>,
+  items: Array<{
+    id: string;
+    act: string;
+    act_code?: string;
+    section: string;
+    section_num?: string;
+    title: string;
+    statutoryText: string;
+    ratio?: string;
+    source: string;
+    year?: number;
+    category: string;
+  }>,
 ): Promise<number> {
   const sql = await pg();
   let added = 0;
   for (const item of items) {
     const rows = await sql`
-      INSERT INTO legal_provisions (id, act, section, title, text, ratio, source, year, category, created_at)
-      VALUES (${`builtin-${item.id}`}, ${item.act}, ${item.section}, ${item.title}, ${item.statutoryText}, ${item.ratio ?? null},
+      INSERT INTO legal_provisions (id, act, act_code, section, section_num, title, text, ratio, source, year, category, created_at)
+      VALUES (${`builtin-${item.id}`}, ${item.act}, ${item.act_code ?? null}, ${item.section}, ${item.section_num ?? null}, ${item.title}, ${item.statutoryText}, ${item.ratio ?? null},
               ${item.source}, ${item.year ?? null}, ${item.category}, ${Date.now()})
       ON CONFLICT (id) DO NOTHING RETURNING id`;
     added += rows.length;
@@ -173,7 +203,7 @@ export async function searchProvisions(question: string, limit = 4): Promise<Pro
   if (!terms.length) return [];
   const sql = await pg();
   const rows = await sql`
-    SELECT id, act, section, title, text, ratio, source, year, ts_rank_cd(tsv, q.query) AS rank
+    SELECT id, act, act_code, section, section_num, title, text, ratio, source, year, category, document_id, created_at, indexed_at, ts_rank_cd(tsv, q.query) AS rank
     FROM legal_provisions
     CROSS JOIN (SELECT to_tsquery('english', ${terms.join(" | ")}) AS query) q
     WHERE tsv @@ q.query
@@ -182,14 +212,57 @@ export async function searchProvisions(question: string, limit = 4): Promise<Pro
   return rows.map((r) => ({
     id: r.id as string,
     act: r.act as string,
+    act_code: (r.act_code as string | undefined) ?? undefined,
     section: r.section as string,
+    section_num: (r.section_num as string | undefined) ?? undefined,
     title: r.title as string,
     text: r.text as string,
     ratio: (r.ratio as string | null) ?? null,
     source: (r.source as string | null) ?? null,
     year: r.year == null ? null : Number(r.year),
-    rank: Number(r.rank),
+    category: (r.category as string | null) ?? null,
+    document_id: (r.document_id as string | null) ?? null,
+    created_at: Number(r.created_at || Date.now()),
+    indexed_at: r.indexed_at == null ? null : Number(r.indexed_at),
+    rank: Number(r.rank || 0),
   }));
+}
+
+export async function lookupProvision(
+  actCode: string,
+  sectionNum: string,
+): Promise<LegalProvisionRow | null> {
+  const sql = await pg();
+  const cleanSec = sectionNum.replace(/^Section\s+/i, "").trim();
+  const baseAct = actCode.replace(/_\d{4}$/, "").trim();
+  const actPattern = `%${baseAct}%`;
+  const secPattern = `%${cleanSec}%`;
+
+  const rows = await sql<LegalProvisionRow[]>`
+    SELECT id, act, act_code, section, section_num, title, text, ratio, source, year, category, document_id, created_at, indexed_at, 1.0 AS rank
+    FROM legal_provisions
+    WHERE (COALESCE(act_code, '') || ' ' || act ILIKE ${actPattern})
+      AND (COALESCE(section_num, '') || ' ' || section ILIKE ${secPattern})
+    LIMIT 1`;
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    id: r.id as string,
+    act: r.act as string,
+    act_code: (r.act_code as string | undefined) ?? undefined,
+    section: r.section as string,
+    section_num: (r.section_num as string | undefined) ?? undefined,
+    title: r.title as string,
+    text: r.text as string,
+    ratio: (r.ratio as string | null) ?? null,
+    source: (r.source as string | null) ?? null,
+    year: r.year == null ? null : Number(r.year),
+    category: (r.category as string | null) ?? null,
+    document_id: (r.document_id as string | null) ?? null,
+    created_at: Number(r.created_at || Date.now()),
+    indexed_at: r.indexed_at == null ? null : Number(r.indexed_at),
+    rank: Number(r.rank || 1),
+  };
 }
 
 /** The shared connection for the corpus tools. */

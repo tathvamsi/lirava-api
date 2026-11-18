@@ -41,6 +41,9 @@ import crypto from "node:crypto";
 import { RunQueue } from "./queue.js";
 import { languageSection } from "./language.js";
 import { getPreferences } from "../preferences/index.js";
+import { CLARIFY_ANSWERED, decideClarify, hasAskBlock, isAnswersMessage, plainAsk, withAnsweredNote } from "./clarify.js";
+import { classifyOutput, modeDirective } from "./output-mode.js";
+import { createOutputArtifact, looksLikeRefusal, writeWithoutRefusing } from "./artifact-output.js";
 
 /** The promise's value, or `fallback` if it takes longer than `ms`. The timer is cleared either way. */
 function withTimeout<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
@@ -297,6 +300,40 @@ export async function sendMessage(
   try {
     const openai = getLlmClient();
 
+    // Before answering, check whether something essential is missing. If so, the reply is a question card
+    // the user answers with a click, and the answer itself waits for those answers (see clarify.ts).
+    console.log("[Clarify] checking whether anything essential is missing");
+    const askText = await decideClarify({
+      userText,
+      history: cleanHistory,
+      hasAttachments: (attachments?.length ?? 0) > 0,
+      matterBrief: matter ? `${matter.title}${matter.client ? `, client ${matter.client}` : ""}${matter.court ? `, ${matter.court}` : ""}. ${(matter.notes || "").slice(0, 600)}` : undefined,
+      signal: abortController.signal,
+    });
+    if (askText && !abortController.signal.aborted) {
+      const askTime = Date.now();
+      const askMsg: MessageRecord = {
+        id: `msg-${crypto.randomUUID()}`,
+        vakilId,
+        vakil_id: vakilId,
+        conversationId: conversationId || null,
+        conversation_id: conversationId || null,
+        role: "vakil",
+        text: askText,
+        createdAt: askTime,
+        created_at: askTime,
+      };
+      await insertMessage({ id: askMsg.id, conversationId, userId, vakilId, role: "vakil", text: askText, createdAt: askTime });
+      await touchConversation(conversationId, userId);
+      emit({ type: "message", vakilId, userId, data: askMsg });
+      emit({ type: "vakil_status", vakilId, userId, data: { status: "idle" } });
+      if (runState.abortController === abortController) {
+        runState.running = false;
+        runState.abortController = null;
+      }
+      return { userMessage: userMsg, assistantMessage: askMsg };
+    }
+
     // 0. Master Orchestrator task analysis & sub-agent routing
     const isMasterOrGeneral =
       vakilId === "soli_master" ||
@@ -304,11 +341,19 @@ export async function sendMessage(
       vakilId.includes("soli") ||
       (!vakilId.includes("vakil") && !vakilId.includes("nyaya") && !vakilId.includes("pramaan") && !vakilId.includes("docket"));
 
+    // An answer to a question card is turned back into the original request plus the facts given, so routing,
+    // the legal search and the model all work from a real task (see clarify.ts).
+    const answering = isAnswersMessage(userText);
+    const originalRequest = answering ? [...cleanHistory].reverse().find((t) => t.role === "user" && !isAnswersMessage(t.content))?.content : undefined;
+    const taskText = answering ? withAnsweredNote(userText, originalRequest) : userText;
+    // A plan or strategy opens as an artifact, a notice or draft in the document editor (see output-mode.ts).
+    const outputMode = classifyOutput(originalRequest ?? userText);
+
     let routing: RoutingDecision | null = null;
     let targetSubAgent = vakilId;
 
     if (isMasterOrGeneral) {
-      routing = routeLegalTask(userText, attachments?.length || 0);
+      routing = routeLegalTask(taskText, attachments?.length || 0);
       targetSubAgent = routing.target;
       console.log(`\x1b[35m[MasterAgent]\x1b[0m ⚖️ Analyzed task -> Delegating to ${routing.name} (${routing.role}). Reason: ${routing.reason}`);
       emit({ type: "agent_routing", vakilId, userId, data: routing });
@@ -318,7 +363,7 @@ export async function sendMessage(
     // Decide first whether this message needs the legal knowledge base at all. A general or casual message searches
     // nothing, so it answers faster and no unrelated statute is attached to it as a source.
     const gate = decideRetrieval({
-      text: userText,
+      text: taskText,
       hasAttachments: (attachments?.length ?? 0) > 0,
       inMatter: Boolean(conversation.matterId),
       recent: cleanHistory.map((m) => m.content),
@@ -327,10 +372,10 @@ export async function sendMessage(
     // The statute library (vector + text search) and the user's own documents are independent, so they are searched
     // at the same time; each has its own time limit and falls back to "nothing found" rather than stalling the answer.
     const [ragResult, documentHits] = await Promise.all([
-      gate.statutes ? withTimeout(retrieveLegalContext(userText).catch(() => null), config.upstreamTimeoutMs * 2, null) : Promise.resolve(null),
+      gate.statutes ? withTimeout(retrieveLegalContext(taskText).catch(() => null), config.upstreamTimeoutMs * 2, null) : Promise.resolve(null),
       gate.documents
         ? withTimeout(
-            searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null }, userText, 5).catch(() => [] as DocumentHit[]),
+            searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null }, taskText, 5).catch(() => [] as DocumentHit[]),
             config.upstreamTimeoutMs,
             [] as DocumentHit[],
           )
@@ -364,7 +409,7 @@ export async function sendMessage(
       sections.push({
         id: "statutes",
         text: ragResult.contextText,
-        tail: `LEGAL COUNSEL DIRECTIVES FOR RETRIEVED STATUTES & PRECEDENTS:\n- Formulate your legal advice and drafting strictly grounded upon the statutory sections and judicial precedents provided above.\n- State exact sections (BNSS, BNS, BSA, CPC, NI Act), statutory ingredients, and relevant ratios.\n- Cite a case or section only if it appears in the sources above, with its citation exactly as printed there. Any other authority you mention must be marked "unverified, from memory" and given without a reporter or neutral citation number. Never invent a paragraph number or a quotation.\n- Do NOT output synthetic platform banners or watermarks. Provide authentic courtroom counsel.`,
+        tail: `LEGAL COUNSEL DIRECTIVES FOR RETRIEVED STATUTES & PRECEDENTS:\n- Ground the legal advice you give in the statutory sections and judicial precedents provided above.\n- When the user asks you to draft a document (a notice, petition, agreement, reply), ALWAYS write the draft in the standard Indian format, even when the sources above are only loosely related: use them only for the provisions you may cite, put [PLACEHOLDERS] for facts you do not have, and never refuse, never say you cannot draft, and never ask the user to share a section, an Act or a search first.\n- State exact sections (BNSS, BNS, BSA, CPC, NI Act), statutory ingredients, and relevant ratios.\n- Cite a case or section only if it appears in the sources above, with its citation exactly as printed there. Any other authority you mention must be marked "unverified, from memory" and given without a reporter or neutral citation number. Never invent a paragraph number or a quotation.\n- Do NOT output synthetic platform banners or watermarks. Provide authentic courtroom counsel.`,
         floorTokens: 350,
         shedOrder: 50,
       });
@@ -430,9 +475,17 @@ export async function sendMessage(
       });
     }
 
+    // The user has just answered a question card: use the answers, do not ask again (see clarify.ts).
+    if (isAnswersMessage(userText)) sections.push({ id: "clarify", text: CLARIFY_ANSWERED, shedOrder: 100 });
+    if (outputMode) sections.push({ id: "output-mode", text: modeDirective(outputMode), shedOrder: 100 });
+
+    // The model reads a card it asked as one plain line, and an answer to a card with an instruction to go ahead.
+    const modelHistory = cleanHistory.map((t) => ({ ...t, content: plainAsk(t.content) }));
+    const modelUserText = taskText;
+
     // Each image takes a share of the window, so the text is fitted into what is left.
     const imageReserve = imageParts.length * config.imageTokens;
-    const fitted = fitPrompt({ sections, history: cleanHistory, userText, windowTokens: Math.max(1024, currentWindow() - imageReserve), answerTokens: config.answerMaxTokens });
+    const fitted = fitPrompt({ sections, history: modelHistory, userText: modelUserText, windowTokens: Math.max(1024, currentWindow() - imageReserve), answerTokens: config.answerMaxTokens });
     // The images travel with the user's message (the last one), which becomes text plus image parts.
     const messages = (imageParts.length > 0
       ? fitted.messages.map((m, i, all) => (i === all.length - 1 && m.role === "user" ? { ...m, content: [{ type: "text", text: m.content }, ...imageParts] } : m))
@@ -586,7 +639,7 @@ export async function sendMessage(
           const small = fitPrompt({
             sections,
             history: [],
-            userText,
+            userText: modelUserText,
             windowTokens: Math.floor(currentWindow() * 0.85),
             answerTokens: Math.min(config.answerMaxTokens, 900),
             minimal: true,
@@ -653,6 +706,17 @@ export async function sendMessage(
 
     asstMsg.text = assistantText;
 
+    // The model refused a request for a document or plan ("please share the section first"): try once more with
+    // a short prompt that orders it to write the work with placeholders. The final message below replaces the text.
+    if (outputMode && !abortController.signal.aborted && looksLikeRefusal(assistantText)) {
+      console.log("[Output] the model refused to write the work; trying once more without the search results");
+      const redone = await writeWithoutRefusing({ mode: outputMode, task: taskText, persona: getAgentPersonaPrompt(vakilId, targetSubAgent), signal: abortController.signal });
+      if (redone) {
+        assistantText = redone;
+        asstMsg.text = redone;
+      }
+    }
+
     // Check every case and section the answer names against the legal library. Nothing the model typed is trusted:
     // a citation is "verified" only when it matches a library record. The result travels beside the answer as its own
     // event (not mixed into `citations`), and a failed or slow check never holds the answer back.
@@ -677,7 +741,12 @@ export async function sendMessage(
       createdAt: asstMsg.createdAt,
     });
     await touchConversation(conversationId, userId);
-    if (matterId) void noteMatterAnswered(matterId, userId, conversationId, asstMsg.text).catch(() => undefined);
+    // The finished plan or document is saved as an artifact (which opens beside the chat) and the chat shows it
+    // as a card. If saving fails, the answer simply stays as chat text.
+    if (outputMode && !hasAskBlock(asstMsg.text)) {
+      await createOutputArtifact({ mode: outputMode, text: asstMsg.text, userId, vakilId, conversationId, messageId: asstMsg.id });
+    }
+    if (matterId && !hasAskBlock(asstMsg.text)) void noteMatterAnswered(matterId, userId, conversationId, asstMsg.text).catch(() => undefined);
 
     // After the answer is saved (so the user never waits for it): fold older messages into the chat's summary
     // once they no longer fit in the window.

@@ -10,6 +10,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "test:e2e": "node --import tsx --test \"tests/e2e/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "pnpm": {

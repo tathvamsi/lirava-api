@@ -5,6 +5,7 @@ import {
   getArtifactForUser,
   listArtifacts,
   saveArtifact,
+  updateArtifactForUser,
 } from "../services/repo/index.js";
 import { generateDocumentDocx, generateDocumentPdf, UnsupportedTextError } from "../services/legal/documents.js";
 import { saveFile } from "../services/files/index.js";
@@ -78,6 +79,28 @@ artifactsRoutes.get("/:id", async (c) => {
   const artifact = await getArtifactForUser(c.req.param("id"), c.get("user").id);
   if (!artifact) return c.json({ error: "Artifact not found" }, 404);
   return c.json({ artifact });
+});
+
+// The user edits a document or plan in the editor: the new text (and title) is saved.
+artifactsRoutes.patch("/:id", async (c) => {
+  const userId = c.get("user").id;
+  const existing = await getArtifactForUser(c.req.param("id"), userId);
+  if (!existing) return c.json({ error: "Artifact not found" }, 404);
+  try {
+    const body = await c.req.json();
+    const content: string | undefined = typeof body.content === "string" ? body.content : undefined;
+    const title: string | undefined = typeof body.title === "string" && body.title.trim() ? body.title.trim().slice(0, 200) : undefined;
+    if (content !== undefined && !content.trim()) return c.json({ error: "A document needs some content." }, 400);
+    if (content && content.length > MAX_CONTENT_CHARS) return c.json({ error: "This document is too large to save." }, 413);
+
+    // No PDF is stored here: the download is built from the current text by the export route, so it always
+    // includes the latest edits and an autosave never piles up files.
+    const artifact = await updateArtifactForUser(existing.id, userId, { title, content });
+    return c.json({ success: true, artifact });
+  } catch (err) {
+    console.error("[artifacts] update failed:", err);
+    return c.json({ error: "Could not save your changes." }, 500);
+  }
 });
 
 artifactsRoutes.delete("/:id", async (c) => {

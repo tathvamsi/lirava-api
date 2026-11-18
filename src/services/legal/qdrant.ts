@@ -4,6 +4,10 @@ import { embedText } from "./embeddings.js";
 
 let qdrantClient: QdrantClient | null = null;
 
+export function setQdrant(client: QdrantClient | null): void {
+  qdrantClient = client;
+}
+
 export function getQdrant(): QdrantClient {
   if (qdrantClient) return qdrantClient;
 
@@ -17,40 +21,110 @@ export function getQdrant(): QdrantClient {
   return qdrantClient;
 }
 
+export interface StatutoryQdrantPayload {
+  id: string;
+  entity_type: "provision";
+  act_code: string;
+  act_title: string;
+  section: string;
+  section_num: string;
+  title: string;
+  text: string;
+  statutoryText: string;
+  ratio?: string;
+  category: string;
+  year: number;
+  source: string;
+  replaces?: { act_code: string; section: string };
+  replaced_by?: { act_code: string; section: string };
+  act: string;
+  [key: string]: any;
+}
+
+export interface PrecedentQdrantPayload {
+  id: string;
+  entity_type: "precedent";
+  case_title: string;
+  primary_citation: string;
+  equivalent_citations: string[];
+  neutral_citation?: string;
+  court: string;
+  year: number;
+  bench_description?: string;
+  ratio: string;
+  principles: string[];
+  statutory_citations: Array<{ act_code: string; section: string }>;
+  category: string;
+  source: string;
+  act: string;
+  section: string;
+  title: string;
+  text: string;
+  statutoryText: string;
+  [key: string]: any;
+}
+
+export type LegalCorpusPayload = StatutoryQdrantPayload | PrecedentQdrantPayload | Record<string, any>;
+
 export interface LegalSearchResult {
   id: string | number;
   score: number;
-  payload?: {
-    act?: string;
-    section?: string;
-    title?: string;
-    text?: string;
-    statutoryText?: string;
-    ratio?: string;
-    source?: string;
-    court?: string;
-    year?: number;
-    category?: string;
-    [key: string]: any;
-  };
+  payload?: LegalCorpusPayload;
 }
 
 export interface LegalChunkPoint {
   id: string | number;
   vector: number[];
-  payload: {
-    act: string;
-    section: string;
-    title: string;
-    text: string;
-    statutoryText?: string;
-    ratio?: string;
-    source?: string;
-    court?: string;
-    year?: number;
-    category?: string;
-    [key: string]: any;
-  };
+  payload: LegalCorpusPayload;
+}
+
+/**
+ * Ensures Qdrant collection 'soli_legal_corpus' exists with 1024-dim Cosine vectors
+ * and creates keyword payload indices.
+ */
+export async function ensureLegalCorpusCollection(): Promise<void> {
+  const collectionName = config.qdrantCollection || "soli_legal_corpus";
+  const qdrant = getQdrant();
+
+  let exists = false;
+  try {
+    if (typeof (qdrant as any).collectionExists === "function") {
+      const res = await (qdrant as any).collectionExists(collectionName);
+      exists = Boolean(res?.exists ?? res);
+    } else if (typeof qdrant.getCollections === "function") {
+      const res = await qdrant.getCollections();
+      exists = res.collections.some((c) => c.name === collectionName);
+    } else if (typeof qdrant.getCollection === "function") {
+      await qdrant.getCollection(collectionName);
+      exists = true;
+    }
+  } catch {
+    exists = false;
+  }
+
+  if (!exists) {
+    console.log(`\x1b[34m[legal-qdrant]\x1b[0m 🔨 Creating Qdrant collection '${collectionName}' (1024-dim, Cosine)...`);
+    await qdrant.createCollection(collectionName, {
+      vectors: {
+        size: 1024,
+        distance: "Cosine",
+      },
+    });
+  }
+
+  // Create payload index for performance filtering
+  if (typeof (qdrant as any).createPayloadIndex === "function") {
+    for (const field of ["entity_type", "act_code", "category"]) {
+      try {
+        await (qdrant as any).createPayloadIndex(collectionName, {
+          field_name: field,
+          field_schema: "keyword",
+        });
+      } catch {
+        // Safe to ignore if already exists or unsupported by mock
+      }
+    }
+  }
 }
 
 /**
@@ -59,7 +133,8 @@ export interface LegalChunkPoint {
 export async function searchStatutes(
   query: string,
   limit: number = config.topK,
-  actFilter?: string
+  actFilter?: string,
+  entityType?: "provision" | "precedent",
 ): Promise<LegalSearchResult[]> {
   const collectionName = config.qdrantCollection || "soli_legal_corpus";
   const trimmed = query.trim();
@@ -68,20 +143,24 @@ export async function searchStatutes(
   try {
     const qdrant = getQdrant();
 
-    // 1. Generate 1024-dimension query vector using local bge-m3 embedding model
+    // 1. Generate 1024-dimension query vector
     const vector = await embedText(trimmed);
 
     // 2. Build metadata filter if specified
-    const filter = actFilter
-      ? {
-          must: [
-            {
-              key: "act",
-              match: { value: actFilter },
-            },
-          ],
-        }
-      : undefined;
+    const mustConditions: any[] = [];
+    if (actFilter) {
+      mustConditions.push({
+        key: "act",
+        match: { value: actFilter },
+      });
+    }
+    if (entityType) {
+      mustConditions.push({
+        key: "entity_type",
+        match: { value: entityType },
+      });
+    }
+    const filter = mustConditions.length > 0 ? { must: mustConditions } : undefined;
 
     console.log(
       `\x1b[36m[legal-qdrant]\x1b[0m 🔍 Vector search in '${collectionName}' (topK=${limit}, filter=${actFilter || "none"}): "${trimmed.slice(0, 60)}..."`
@@ -121,6 +200,7 @@ export async function upsertLegalChunks(points: LegalChunkPoint[]): Promise<bool
   if (!points || points.length === 0) return true;
 
   try {
+    await ensureLegalCorpusCollection();
     const qdrant = getQdrant();
     await qdrant.upsert(collectionName, {
       wait: true,

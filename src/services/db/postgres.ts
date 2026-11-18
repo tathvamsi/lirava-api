@@ -21,6 +21,10 @@ export interface SessionRow {
 
 let sqlInstance: postgres.Sql | null = null;
 
+export function setSql(client: postgres.Sql | null): void {
+  sqlInstance = client;
+}
+
 export function getSql(): postgres.Sql | null {
   if (sqlInstance) return sqlInstance;
   if (!config.databaseUrl) return null;
