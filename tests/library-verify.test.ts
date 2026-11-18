@@ -454,3 +454,57 @@ describe("official translations of a judgment", () => {
     assert.deepEqual(verdicts[0].translations, ["HIN", "KAN"]);
   });
 });
+
+describe("Constitution articles, the SC/ST Act, sub-clauses and CPC orders", () => {
+  const store = new MemoryLibraryStore()
+    .addProvision({ id: "coi-21", act_code: "COI", section_num: "21", title: "Protection of life and personal liberty" })
+    .addProvision({ id: "coi-226", act_code: "COI", section_num: "226", title: "Power of High Courts to issue certain writs" })
+    .addProvision({ id: "scst-3", act_code: "SCST", section_num: "3", title: "Punishments for offences of atrocities" })
+    .addProvision({ id: "bns-103", act_code: "BNS", section_num: "103", title: "Punishment for murder" })
+    .addProvision({ id: "cpc-9", act_code: "CPC", section_num: "9", title: "Courts to try all civil suits unless barred" });
+  const check = async (text: string) => (await verifyAnswer(text, store)).verdicts;
+
+  it("reads articles of the Constitution, named or bare", () => {
+    assert.deepEqual(keysOf("Article 21 of the Constitution"), ["COI:21"]);
+    assert.deepEqual(keysOf("Art. 226 of the Constitution of India"), ["COI:226"]);
+    assert.deepEqual(keysOf("Articles 14 and 21 of the Constitution"), ["COI:14", "COI:21"]);
+    assert.deepEqual(keysOf("the right under Article 21"), ["COI:21"]);
+    assert.deepEqual(keysOf("Article 19(1)(a) of the Constitution"), ["COI:19(1)(A)"]);
+  });
+
+  it("does not take another document's article for the Constitution", () => {
+    assert.deepEqual(keysOf("Article 3 of the agreement requires notice."), []);
+    assert.deepEqual(keysOf("Article 54 of the Schedule to the Limitation Act"), []);
+    assert.deepEqual(keysOf("Article 5 of the Companies Rules"), []);
+    assert.deepEqual(keysOf("the articles of association were amended"), []);
+  });
+
+  it("verifies a real article and a sub-clause of it, and rejects an article that does not exist", async () => {
+    const [v, sub, none] = await check("Article 21 of the Constitution. Article 226(1) of the Constitution. Article 999 of the Constitution.");
+    assert.equal(v.status, "verified");
+    assert.equal(v.library_title, "Protection of life and personal liberty");
+    assert.equal(sub.status, "verified");
+    assert.equal(none.status, "unverified");
+    assert.equal(none.reason, "not_in_library");
+  });
+
+  it("looks up a section without its sub-clause, so Section 103(1) BNS verifies and 999(1) does not", async () => {
+    const [a, b] = await check("Section 103(1) BNS and Section 999(1) BNS.");
+    assert.equal(a.status, "verified");
+    assert.equal(b.status, "unverified");
+  });
+
+  it("reads the SC/ST Act by its common names", () => {
+    for (const t of ["Section 3 of the SC/ST Act", "Section 3 of the SC/ST (Prevention of Atrocities) Act", "s. 3 Atrocities Act", "Section 3 of the Scheduled Castes and the Scheduled Tribes (Prevention of Atrocities) Act, 1989"]) {
+      assert.deepEqual(keysOf(t), ["SCST:3"], t);
+    }
+  });
+
+  it("says CPC Orders and Rules cannot be checked, rather than that they are missing", async () => {
+    const [v] = await check("Order XXXIX Rule 1 CPC");
+    assert.equal(v.status, "unverified");
+    assert.equal(v.reason, "not_covered");
+    const [sec] = await check("Section 9 CPC");
+    assert.equal(sec.status, "verified");
+  });
+});

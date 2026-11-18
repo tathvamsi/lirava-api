@@ -196,7 +196,7 @@ export class PgLibraryStore implements LibraryStore {
     return sql<CasePara[]>`SELECT case_id, para_no, text FROM library_case_paras WHERE case_id = ${caseId} ORDER BY seq`;
   }
 
-  /** Which Acts have at least one section loaded (in either statute table). Cached briefly: it changes only when an Act is ingested. */
+  /** Which Acts have at least one sourced section loaded. Cached briefly: it changes only when an Act is ingested. */
   async holdsAct(actCode: string): Promise<boolean> {
     const sql = getSql();
     if (!sql) return true; // cannot tell, so do not claim the Act is missing
@@ -204,9 +204,9 @@ export class PgLibraryStore implements LibraryStore {
     if (!heldActs || now - heldActsAt > 60_000) {
       try {
         await ensureSchema();
+        // Only text with a recorded source counts. The hand-typed seed rows (legal_provisions) feed search, never "verified".
         const loaded = await sql<Array<{ code: string }>>`SELECT DISTINCT UPPER(act_code) AS code FROM library_provisions`;
-        const seeds = await sql<Array<{ code: string }>>`SELECT DISTINCT UPPER(act_code) AS code FROM legal_provisions`;
-        heldActs = new Set([...loaded, ...seeds].map((r) => r.code.replace(/_\d{4}$/, "")));
+        heldActs = new Set(loaded.map((r) => r.code));
         heldActsAt = now;
       } catch {
         return true;
@@ -219,7 +219,8 @@ export class PgLibraryStore implements LibraryStore {
     const sql = getSql();
     if (!sql) return null;
     const code = actCode.toUpperCase();
-    // The loaded statute text comes first; the hand-written seed rows are the fallback for sections it does not hold.
+    // Only sections loaded from a recorded source (library_provisions) can be verified. The hand-typed seed rows in
+    // legal_provisions have no official source, so they are no longer a fallback here (they still feed search).
     try {
       await ensureSchema();
       const loaded = await sql<Array<{ id: string; act_code: string; section_num: string; title: string; source_url: string | null; act_status: string; text: string }>>`
@@ -230,14 +231,9 @@ export class PgLibraryStore implements LibraryStore {
         return { id: r.id, act_code: r.act_code, section_num: r.section_num, title: r.title, source: r.source_url, repealed: r.act_status === "repealed", text: r.text };
       }
     } catch {
-      /* fall through to the seed table */
+      /* a database error is "not found", never "verified" */
     }
-    const candidates = ACT_YEARS[code] ? [code, `${code}_${ACT_YEARS[code]}`] : [code];
-    const rows = await sql<Array<{ id: string; act_code: string; section_num: string; title: string; source: string | null }>>`
-      SELECT id, act_code, section_num, title, source FROM legal_provisions
-      WHERE UPPER(act_code) IN ${sql(candidates)} AND UPPER(section_num) = ${sectionNum.toUpperCase()}
-      LIMIT 1`;
-    return rows[0] ?? null;
+    return null;
   }
 }
 

@@ -89,7 +89,9 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
     const base = { raw: cite.raw, span: cite.span, kind: cite.kind } as const;
 
     if (cite.kind === "statute") {
-      const provision = await store.findProvision(cite.act_code, cite.section);
+      // "Section 103(1)(a)" is looked up as section 103. The sub-clause is not checked, only that the section exists.
+      const sectionBase = cite.section.replace(/\(.*$/, "");
+      const provision = await store.findProvision(cite.act_code, sectionBase);
       let warning: string | undefined;
       const d = options.offenceDate;
       if (d && NEW_CODES.has(cite.act_code) && d < NEW_CODES_IN_FORCE) warning = `The offence date (${d}) is before 1 July 2024, so the old law (IPC, CrPC or Evidence Act) applies, not ${cite.act_code}.`;
@@ -102,7 +104,11 @@ export async function verifyAnswer(text: string, store: LibraryStore, options: V
       // An Act whose text is not loaded at all is "not covered": the library can say nothing about it. An Act it does hold,
       // with no such section, is "not in library". When the store cannot say which Acts it holds, the old answer stands.
       const covered = store.holdsAct ? await store.holdsAct(cite.act_code).catch(() => true) : true;
-      if (!covered) {
+      if (/^O\d+_R/.test(cite.section)) {
+        // CPC Orders and Rules are in the Act's First Schedule, which is not loaded, so the library cannot say either way.
+        const note = "The library does not hold the Orders and Rules of the CPC yet, so this could not be checked either way.";
+        verdicts.push({ ...base, status: "unverified", reason: "not_covered", warning: warning ? `${warning} ${note}` : note });
+      } else if (!covered) {
         const note = `The library does not hold the text of ${cite.act_code} yet, so this section could not be checked either way.`;
         verdicts.push({ ...base, status: "unverified", reason: "not_covered", warning: warning ? `${warning} ${note}` : note });
       } else {

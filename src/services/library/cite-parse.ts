@@ -37,6 +37,7 @@ const ACTS: Array<{ code: string; pattern: string }> = [
   { code: "POCSO", pattern: "POCSO(?:\\s+Act)?|Protection\\s+of\\s+Children\\s+from\\s+Sexual\\s+Offences\\s+Act(?:,?\\s*2012)?" },
   { code: "PCA", pattern: "Prevention\\s+of\\s+Corruption\\s+Act(?:,?\\s*1988)?|P\\.?\\s?C\\.?\\s+Act" },
   { code: "ITA", pattern: "Information\\s+Technology\\s+Act(?:,?\\s*2000)?|I\\.?\\s?T\\.?\\s+Act" },
+  { code: "SCST", pattern: "SC\\s?/\\s?ST(?:\\s+\\(?(?:PoA|Prevention\\s+of\\s+Atrocities)\\)?)?\\s+Act|(?:PoA|Atrocities)\\s+Act|Scheduled\\s+Castes\\s+and\\s+(?:the\\s+)?Scheduled\\s+Tribes\\s+\\(Prevention\\s+of\\s+Atrocities\\)\\s+Act(?:,?\\s*1989)?" },
 ];
 const ACT_GROUP = ACTS.map((a) => `(?:${a.pattern})`).join("|");
 
@@ -140,6 +141,22 @@ export function extractCitations(input: string): ParsedCite[] {
         // Each section in a list shares the span of the whole phrase; overlap rules would drop all but the first, so push directly.
         out.push({ kind: "statute", act_code: code, section: normSection(s), raw: m[0], span: [m.index, m.index + m[0].length] });
       }
+    }
+  }
+  // Articles of the Constitution: "Article 21", "Articles 14 and 21 of the Constitution", "Art. 226(1) of the Constitution of India".
+  // A bare "Article 21" is taken as the Constitution (that is what Indian legal writing means), except when it goes on to name
+  // another Act or a Schedule ("Article 54 of the Schedule to the Limitation Act"), where it is not.
+  {
+    const ARTICLE = "\\d{1,3}[A-Z]{0,2}(?:\\(\\w{1,4}\\))*";
+    const list = `${ARTICLE}(?:\\s*(?:,|and|&|/)\\s*${ARTICLE})*`;
+    const re = new RegExp(`(?<![\\w'’])(?:articles?|arts?)\\b\\.?\\s*(${list})(?:\\s*(?:of|,)\\s*(?:the\\s+)?(Constitution(?:\\s+of\\s+India)?|COI)\\b)?`, "gi");
+    while ((m = re.exec(text))) {
+      const named = m[2];
+      const rest = text.slice(m.index + m[0].length, m.index + m[0].length + 60);
+      // "Article 3 of the agreement", "Article 54 of the Schedule to the Limitation Act", "Article 5 of the Companies Rules": not the Constitution.
+      if (!named && /^\s*,?\s*(?:of|in|under)\s+(?:the\s+)?(?:[a-z]|(?:First\s+|Second\s+|Third\s+)?Schedule\b|[A-Z][A-Za-z]+(?:\s+[A-Za-z]+){0,5}\s+(?:Act|Code|Rules?|Regulations?|Order|Sanhita|Adhiniyam)\b)/.test(rest)) continue;
+      const span: [number, number] = [m.index, m.index + m[0].length];
+      for (const a of m[1].split(/\s*(?:,|and|&|\/)\s*/i).filter(Boolean)) out.push({ kind: "statute", act_code: "COI", section: normSection(a), raw: m[0], span });
     }
   }
   // "BNSS 482", "IPC section 302", "BNS, s. 103"

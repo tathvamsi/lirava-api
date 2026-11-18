@@ -11,7 +11,10 @@ import { join } from "node:path";
 import { config } from "../src/config.js";
 import { upsertLibraryProvisions, type LibraryProvisionRow } from "../src/services/library/pg-store.js";
 
-const DIR = join(import.meta.dirname, "..", "data", "statutes");
+// The merged set built by scripts/statutes/assemble.py (India Code, then official PDFs, then Open India Law for gaps).
+// `--dir=<name>` reads another folder under data/ (for example statutes, the earlier Open India Law output).
+const dirName = process.argv.find((a) => a.startsWith("--dir="))?.slice("--dir=".length) ?? "statutes-final";
+const DIR = join(import.meta.dirname, "..", "data", dirName);
 const apply = process.argv.includes("--apply");
 
 function load(): LibraryProvisionRow[] {

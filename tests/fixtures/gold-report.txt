@@ -1,4 +1,4 @@
-Gold set against the real library: 364/364 as expected (2 fixture-only cases skipped)
+Gold set against the real library: 390/390 as expected (2 fixture-only cases skipped)
   false verifications (must be 0): 0
   false alarms:                    0
   missed verifications:            0
@@ -14,8 +14,8 @@ Gold set against the real library: 364/364 as expected (2 fixture-only cases ski
   scc_online_not_covered           5/5
   scale_not_covered                5/5
   hc_neutral_not_covered           5/5
-  statute_present                 36/36
-  statute_section_missing         12/12
+  statute_present                 42/42
+  statute_section_missing         14/14
   date_warning                     3/3
   indic_statute_hi                 9/9
   indic_statute_mr                 3/3
@@ -25,16 +25,38 @@ Gold set against the real library: 364/364 as expected (2 fixture-only cases ski
   indic_statute_missing            2/2
   indic_sentence_real_insc         6/6
   indic_sentence_invented_insc     3/3
+  constitution_article             7/7
+  constitution_article_missing     1/1
+  not_a_constitution_article       3/3
+  subclause                        2/2
+  subclause_missing                1/1
+  crpc_key_sections                1/1
+  bns_robbery                      1/1
+  scst_act                         1/1
+  cpc_order_not_covered            1/1
   injection                        3/3
   no_citation                      8/8
   mixed_answer                     8/8
 
-Measured 2026-11-18 against the real library (38,397 Supreme Court judgments; 2,335 statute sections), commit after 291d8c0.
+Measured 2026-11-18 against the real library: 38,397 Supreme Court judgments and 3,830 statute sections (16 Acts).
 Rebuild the set: node --import tsx scripts/build-gold.ts   Re-measure: node --import tsx scripts/eval-library.ts
 
-Known limits of the library, found while measuring:
-- 96 INSC numbers are carried by more than one record (216 records, 0.56%); a citation using one of them comes back
-  "partial / ambiguous", never verified. Cause appears to be errors in the source metadata.
+Where the statutes come from (scripts/statutes/assemble.py; priority top to bottom, lower sources fill gaps only):
+  1. India Code, indiacode.gov.in JSON API (fetch_india_code.py): BNS, BNSS, BSA, CPC, SC/ST Act, NIA, ICA, NDPS, PMLA, ITA, POCSO, PCA
+  2. Official PDFs (extract_pdf_acts.py): CrPC 1973 (WIPO Lex copy of the India Code PDF, last modified 2011, so later
+     amendments may be missing), Constitution (Legislative Department, English-Kannada edition as on 11 Nov 2025),
+     IPC 1860 and Indian Evidence Act 1872 (WIPO Lex copies; the Evidence Act is amended to Act 34 of 2019)
+  3. Open India Law (CC BY 4.0), only for sections nothing else had: 20 IPC, 2 IEA, 2 ICA, 6 PCA sections
+Section titles agree between India Code and Open India Law for the great majority of overlapping sections; where they differ
+the older dataset usually holds footnote text as the title.
+
+Known limits:
+- 96 INSC numbers are carried by more than one record (216 records, 0.56%); they come back "partial / ambiguous", never verified.
 - SCC, AIR, SCC OnLine, SCALE and High Court neutral citations are "not covered": the source holds INSC and SCR only.
-- CrPC and CPC sections currently verify only from hand-typed seed rows with no official source; Phase 3 replaces them.
-- The Constitution and SC/ST Act are not loaded.
+- CPC Orders and Rules (First Schedule) are not loaded: "Order XXXIX Rule 1 CPC" reads "not covered".
+- Section numbers with no record: Constitution 238 and 389 (omitted articles); IPC 13, 15, 17, 56, 58, 59, 61, 62, 162-165, 226,
+  480, 490, 492 (all but 17 are omitted or repealed sections, 17 is a real gap); IEA 145 and 161 (145 is a real gap).
+- Sub-clauses ("Section 103(1)(a)") are looked up as the section; the sub-clause itself is not checked.
+- The hand-typed seed rows (legal_provisions) no longer back "verified"; they still feed search.
+- The Constitution text comes from a two-language edition: titles are clean, article text is English-only with some leftover
+  footnote markers.
