@@ -2,6 +2,8 @@ import { getLlmClient } from "./client.js";
 import { getMatterForUser, noteMatterAnswered, noteMatterWorkStarted } from "../repo/index.js";
 import { emit } from "../bus/index.js";
 import { buildDocumentContext, statuteCitations } from "../documents/context.js";
+import { memoryPromptSection } from "../memories/index.js";
+import { linkedKnowledgeIds } from "../knowledge-bases/index.js";
 import { PgLibraryStore } from "../library/pg-store.js";
 import { verifyAnswer } from "../library/verify.js";
 import { indexedStatus, linkDocuments, searchDocuments, type DocumentHit } from "../documents/index.js";
@@ -362,10 +364,12 @@ export async function sendMessage(
     // 1. Retrieve RAG context from vector legal corpus (Qdrant) and ingested vault
     // Decide first whether this message needs the legal knowledge base at all. A general or casual message searches
     // nothing, so it answers faster and no unrelated statute is attached to it as a source.
+    // Knowledge bases the user attached to this chat or its matter count as case context, like a matter's own files.
+    const knowledgeIds = await linkedKnowledgeIds(userId, conversationId, conversation.matterId ?? null);
     const gate = decideRetrieval({
       text: taskText,
       hasAttachments: (attachments?.length ?? 0) > 0,
-      inMatter: Boolean(conversation.matterId),
+      inMatter: Boolean(conversation.matterId) || knowledgeIds.length > 0,
       recent: cleanHistory.map((m) => m.content),
     });
     console.log(`\x1b[35m[RetrievalGate]\x1b[0m 🧭 statutes=${gate.statutes ? "search" : "skip"}, documents=${gate.documents ? "search" : "skip"} (${gate.reason})`);
@@ -375,7 +379,7 @@ export async function sendMessage(
       gate.statutes ? withTimeout(retrieveLegalContext(taskText).catch(() => null), config.upstreamTimeoutMs * 2, null) : Promise.resolve(null),
       gate.documents
         ? withTimeout(
-            searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null }, taskText, 5).catch(() => [] as DocumentHit[]),
+            searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null, knowledgeIds }, taskText, 5).catch(() => [] as DocumentHit[]),
             config.upstreamTimeoutMs,
             [] as DocumentHit[],
           )
@@ -424,6 +428,10 @@ export async function sendMessage(
     if (documentContext.text) {
       sections.push({ id: "documents", text: documentContext.body ?? documentContext.text, tail: documentContext.rules, floorTokens: 300, shedOrder: 40 });
     }
+
+    // What the user asked Lirava to remember about them (settings → Memory). Shed early if the prompt is too long.
+    const memoryText = await memoryPromptSection(userId);
+    if (memoryText) sections.push({ id: "memories", text: memoryText, floorTokens: 80, shedOrder: 30 });
 
     if (attachedDocumentContext) {
       sections.push({

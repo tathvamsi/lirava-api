@@ -6,6 +6,7 @@ assertProductionConfig();
 
 const { default: app } = await import("./index.js");
 const { closeSql } = await import("./services/db/postgres.js");
+const { startAutomationScheduler } = await import("./services/automations/index.js");
 
 const server = serve(
   {
@@ -15,6 +16,8 @@ const server = serve(
   },
   (info) => {
     console.log(`[soli-backend] listening on http://${config.host}:${info.port} (${config.nodeEnv})`);
+    // Scheduled automations run only in the real server, never when the app is loaded by tests.
+    startAutomationScheduler();
   },
 );
 

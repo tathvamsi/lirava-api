@@ -18,7 +18,10 @@ import { authRoutes } from "./routes/auth.routes.js";
 import { publicRoutes } from "./routes/public.routes.js";
 import { documentsRoutes } from "./routes/documents.routes.js";
 import { preferencesRoutes } from "./routes/preferences.routes.js";
-import { checkLlmHealth } from "./services/agent/client.js";
+import { memoriesRoutes } from "./routes/memories.routes.js";
+import { knowledgeBasesRoutes } from "./routes/knowledge-bases.routes.js";
+import { notesRoutes } from "./routes/notes.routes.js";
+import { automationsRoutes } from "./routes/automations.routes.js";import { checkLlmHealth } from "./services/agent/client.js";
 import { getSnapshot } from "./services/repo/index.js";
 import { seedLegalCorpus } from "./services/legal/corpus-seeder.js";
 import { requireAuth } from "./middleware/auth.js";
@@ -163,7 +166,10 @@ app.route("/api/artifacts", artifactsRoutes);
 app.route("/api/files", filesRoutes);
 app.route("/api/documents", documentsRoutes);
 app.route("/api/preferences", preferencesRoutes);
-app.route("/api", integrationsRoutes);
+app.route("/api/memories", memoriesRoutes);
+app.route("/api/knowledge-bases", knowledgeBasesRoutes);
+app.route("/api/notes", notesRoutes);
+app.route("/api/automations", automationsRoutes);app.route("/api", integrationsRoutes);
 
 app.get("/api/snapshot", requireAuth, async (c) => {
   const userId = c.get("user").id;

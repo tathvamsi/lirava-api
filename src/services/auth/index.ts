@@ -9,6 +9,9 @@ import {
   insertSession,
   findValidSession,
   deleteSession,
+  deleteOtherSessions,
+  updateUserName,
+  updateUserPassword,
   type UserRow,
 } from "../db/postgres.js";
 
@@ -214,6 +217,38 @@ export async function verifySession(token: string): Promise<PublicUser | null> {
   if (!valid) return null;
 
   return toPublicUser(valid.user);
+}
+
+/** Changes the display name. */
+export async function updateProfile(userId: string, input: { name: string }): Promise<PublicUser> {
+  const name = (input.name || "").trim();
+  if (name.length < 2 || name.length > 100) throw new AuthError(400, "Name must be between 2 and 100 characters.");
+  const row = await updateUserName(userId, name);
+  if (!row) throw new AuthError(401, "Session expired or invalid.");
+  return toPublicUser(row);
+}
+
+/**
+ * Changes the password after checking the current one, then signs the account out of every other device.
+ * A wrong current password is a 403, not a 401, so the browser does not read it as an expired session.
+ */
+export async function changePassword(input: {
+  email: string;
+  currentSessionId: string;
+  currentPassword: string;
+  newPassword: string;
+}): Promise<{ otherSessionsEnded: number }> {
+  const { currentPassword, newPassword } = input;
+  if (!currentPassword || currentPassword.length > 128) throw new AuthError(400, "Enter your current password.");
+  assertPasswordStrong(newPassword);
+  if (newPassword === currentPassword) throw new AuthError(400, "Choose a password that is different from the current one.");
+
+  const row = await findUserByEmail(input.email);
+  const matches = await verifyPassword(currentPassword, row ? row.password_hash : DUMMY_HASH);
+  if (!row || !matches) throw new AuthError(403, "Your current password is not correct.");
+
+  await updateUserPassword(row.id, await hashPassword(newPassword));
+  return { otherSessionsEnded: await deleteOtherSessions(row.id, input.currentSessionId) };
 }
 
 export async function logoutSession(token: string): Promise<boolean> {

@@ -351,6 +351,8 @@ export function searchTerms(question: string): string[] {
 export interface SearchScope {
   conversationId: string;
   matterId?: string | null;
+  /** Knowledge bases attached to the chat or its matter; their files are searched too (see services/knowledge-bases). */
+  knowledgeIds?: string[];
 }
 
 /**
@@ -362,6 +364,11 @@ export async function searchDocuments(userId: string, scope: SearchScope, questi
   const sql = await pg();
   const matterId = scope.matterId ?? null;
   const terms = searchTerms(question);
+  // Files of attached knowledge bases. Left out of the SQL entirely when none are attached.
+  const knowledgeIds = scope.knowledgeIds ?? [];
+  const inKnowledge = knowledgeIds.length
+    ? sql`OR d.id IN (SELECT document_id FROM knowledge_files WHERE user_id = ${userId} AND knowledge_id = ANY(${knowledgeIds}))`
+    : sql``;
 
   const toHit = (r: Record<string, unknown>): DocumentHit => ({
     documentId: r.document_id as string,
@@ -380,7 +387,7 @@ export async function searchDocuments(userId: string, scope: SearchScope, questi
       CROSS JOIN (SELECT to_tsquery('english', ${terms.join(" | ")}) AS query) q
       WHERE c.user_id = ${userId} AND d.user_id = ${userId}
         AND c.tsv @@ q.query
-        AND (d.conversation_id = ${scope.conversationId} OR (${matterId}::text IS NOT NULL AND d.matter_id = ${matterId}))
+        AND (d.conversation_id = ${scope.conversationId} OR (${matterId}::text IS NOT NULL AND d.matter_id = ${matterId}) ${inKnowledge})
       ORDER BY rank DESC, c.page ASC, c.idx ASC
       LIMIT ${limit}`;
     if (rows.length) return rows.map(toHit);
@@ -392,7 +399,7 @@ export async function searchDocuments(userId: string, scope: SearchScope, questi
     FROM document_chunks c
     JOIN matter_documents d ON d.id = c.document_id
     WHERE c.user_id = ${userId} AND d.user_id = ${userId}
-      AND (d.conversation_id = ${scope.conversationId} OR (${matterId}::text IS NOT NULL AND d.matter_id = ${matterId}))
+      AND (d.conversation_id = ${scope.conversationId} OR (${matterId}::text IS NOT NULL AND d.matter_id = ${matterId}) ${inKnowledge})
     ORDER BY c.document_id, c.page ASC, c.idx ASC
     LIMIT ${limit}`;
   return rows.map(toHit);
@@ -428,6 +435,36 @@ export async function listMatterDocuments(userId: string, matterId: string): Pro
     matterId: (r.matter_id as string | null) ?? null,
     createdAt: Number(r.created_at),
   }));
+}
+
+const toSummary = (r: Record<string, unknown>): DocumentSummary => ({
+  id: r.id as string,
+  name: r.name as string,
+  status: r.status as IndexStatus,
+  pages: Number(r.pages),
+  unit: r.unit as "page" | "section",
+  note: (r.note as string | null) ?? null,
+  conversationId: (r.conversation_id as string | null) ?? null,
+  matterId: (r.matter_id as string | null) ?? null,
+  createdAt: Number(r.created_at),
+});
+
+/** The user's documents with these ids, newest first. Ids that are not theirs are simply absent. */
+export async function describeDocuments(userId: string, ids: string[]): Promise<DocumentSummary[]> {
+  if (!userId || !ids.length) return [];
+  const sql = await pg();
+  const rows = await sql`
+    SELECT id, name, status, pages, unit, note, conversation_id, matter_id, created_at
+    FROM matter_documents WHERE user_id = ${userId} AND id = ANY(${ids}) ORDER BY created_at DESC`;
+  return rows.map(toSummary);
+}
+
+/** Removes these documents (their passages go with them) and the stored files behind them. */
+export async function deleteDocumentsByIds(userId: string, ids: string[]): Promise<void> {
+  if (!userId || !ids.length) return;
+  const sql = await pg();
+  const rows = await sql`DELETE FROM matter_documents WHERE user_id = ${userId} AND id = ANY(${ids}) RETURNING id`;
+  await deleteFilesForUser(rows.map((row) => row.id as string), userId);
 }
 
 /** Deleting a chat removes the documents that belonged only to it (matter documents stay with the matter). */

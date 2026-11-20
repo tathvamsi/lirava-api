@@ -113,6 +113,24 @@ export async function deleteSession(sessionId: string): Promise<boolean> {
   return true;
 }
 
+export async function updateUserName(userId: string, name: string): Promise<UserRow | null> {
+  const rows = await db()<UserRow[]>`
+    UPDATE users SET name = ${name.trim()}, updated_at = NOW() WHERE id = ${userId}
+    RETURNING id, name, email, password_hash, role, created_at, updated_at`;
+  return rows[0] ?? null;
+}
+
+export async function updateUserPassword(userId: string, passwordHash: string): Promise<boolean> {
+  const rows = await db()`UPDATE users SET password_hash = ${passwordHash}, updated_at = NOW() WHERE id = ${userId} RETURNING id`;
+  return rows.length > 0;
+}
+
+/** Signs the user out everywhere except the session they are using. Returns how many sessions ended. */
+export async function deleteOtherSessions(userId: string, keepSessionId: string): Promise<number> {
+  const rows = await db()`DELETE FROM sessions WHERE user_id = ${userId} AND id <> ${keepSessionId} RETURNING id`;
+  return rows.length;
+}
+
 export async function closeSql(): Promise<void> {
   if (sqlInstance) {
     await sqlInstance.end();
