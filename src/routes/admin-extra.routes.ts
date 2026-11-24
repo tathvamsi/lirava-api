@@ -19,6 +19,7 @@ import {
   updateProvisionRow,
 } from "../services/admin/corpus.js";
 import { getSql } from "../services/db/postgres.js";
+import { defaultProvider, publicProviders } from "../services/agent/providers.js";
 
 /** Corpus, user and system tools for the internal admin app. Mounted under /api/admin (administrators only). */
 export const adminExtraRoutes = new Hono<AuthEnv>();
@@ -196,8 +197,9 @@ adminExtraRoutes.get("/system", (c) => {
     environment: config.nodeEnv,
     node: process.version,
     uptimeSeconds: Math.floor(process.uptime()),
-    provider: config.ownLlm ? "own server" : "NVIDIA NIM",
-    ownLlm: config.ownLlm,
+    // The provider chats use when none is picked, and which of the three are set up (never their keys).
+    provider: defaultProvider().label,
+    providers: publicProviders().map((p) => ({ id: p.id, label: p.label, model: p.model, available: p.available, isDefault: p.isDefault })),
     llm: { host: host(config.customLlmBaseUrl), model: config.customLlmModel, keyConfigured: Boolean(config.customLlmApiKey && config.customLlmApiKey !== "not-needed") },
     embeddings: { model: config.customEmbeddingModel, dimensions: config.embeddingDimensions },
     qdrant: { host: host(config.qdrantUrl), collection: config.qdrantCollection, keyConfigured: Boolean(config.qdrantApiKey) },

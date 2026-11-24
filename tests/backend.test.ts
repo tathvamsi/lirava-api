@@ -4,11 +4,21 @@ import { after, describe, it } from "node:test";
 import { pgData } from "../src/services/data/pg.js";
 import assert from "node:assert/strict";
 import app from "../src/index.js";
+import { config } from "../src/config.js";
 import { createTestAdmin, createTestUser } from "./helpers.js";
 import { generateCourtPdf, generateCourtDocx } from "../src/services/legal/court-engine.js";
 import { createApiKey } from "../src/services/admin/api-keys.js";
 import { registerModel } from "../src/services/admin/model-registry.js";
 import { registerNode } from "../src/services/admin/node-manager.js";
+
+/** Points the model at an address nobody listens on for the length of one test, so "the model is down" does not depend on the real server. */
+function modelDown(t: { after: (fn: () => void) => void }) {
+  const saved = config.customLlmBaseUrl;
+  config.customLlmBaseUrl = "http://127.0.0.1:9/v1";
+  t.after(() => {
+    config.customLlmBaseUrl = saved;
+  });
+}
 
 describe("Soli Standalone Backend Service", () => {
   it("should respond to root endpoint with service metadata", async () => {
@@ -134,7 +144,8 @@ describe("Soli Standalone Backend Service", () => {
     assert.equal((retrieved as any).key_hash, undefined);
   });
 
-  it("should provide authoritative legal consultation when LLM node is offline without exposing raw node diagnostics", { timeout: 120000 }, async () => {
+  it("should say the model is unavailable, with no canned legal text, when the LLM node is offline", { timeout: 120000 }, async (t) => {
+    modelDown(t);
     const user = await createTestUser("consult");
     const convId = `conv_test_${Date.now()}`;
     await app.request("/api/conversations", {
@@ -160,11 +171,29 @@ describe("Soli Standalone Backend Service", () => {
     assert.ok(body.assistantMessage);
     assert.equal(body.assistantMessage.role, "vakil");
     assert.equal(body.assistantMessage.conversationId, convId);
-    // Verify professional legal analysis is provided
-    assert.ok(body.assistantMessage.text.includes("Bail") || body.assistantMessage.text.includes("bail"));
-    assert.ok(body.assistantMessage.text.includes("Bharatiya Nagarik Suraksha Sanhita") || body.assistantMessage.text.includes("BNSS"));
+    // The user is told the model is unavailable. No canned legal text stands in for an answer.
+    assert.match(body.assistantMessage.text, /AI model is not available right now/);
+    assert.doesNotMatch(body.assistantMessage.text, /Bharatiya Nagarik|BNSS|Section 4\d\d|Satender|Chidambaram|reference summary/i);
     // Verify internal technical details and IP addresses are NEVER leaked to the user
     assert.ok(!body.assistantMessage.text.includes("Local Inference Node Notice"));
     assert.ok(!body.assistantMessage.text.includes("10.10.0.247"));
+  });
+
+  it("does not turn the unavailable message into a document when a draft was asked for", { timeout: 120000 }, async (t) => {
+    modelDown(t);
+    const user = await createTestUser("nodraft");
+    const convId = `conv_test_${Date.now()}`;
+    await app.request("/api/conversations", { method: "POST", headers: user.headers, body: JSON.stringify({ vakilId: "dot_test", id: convId }) });
+    const res = await app.request("/api/agent/message", {
+      method: "POST",
+      headers: user.headers,
+      body: JSON.stringify({ vakilId: "dot_test", text: "Draft a legal notice for recovery of Rs. 5,00,000 under a dishonoured cheque, in English.", conversationId: convId }),
+    });
+    assert.equal(res.status, 200);
+    const text = (await res.json()).assistantMessage.text as string;
+    assert.match(text, /AI model is not available right now/);
+    assert.doesNotMatch(text, /legal notice|prayer|cause title|dishonoured/i);
+    const list = await (await app.request("/api/artifacts", { headers: user.headers })).json();
+    assert.equal(list.artifacts.length, 0, "no artifact was created from the unavailable message");
   });
 });

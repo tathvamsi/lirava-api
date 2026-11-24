@@ -7,11 +7,12 @@
  * progress, and returns. The caller keeps calling until the status is "ready". That keeps every request
  * short enough for serverless hosting, and a slow model never loses finished work.
  */
-import { config } from "../../config.js";
+import { llmModel } from "../agent/providers.js";
 import { getLlmClient } from "../agent/client.js";
 import { getSql } from "../db/postgres.js";
 import { withSchemaLock } from "../db/schema-lock.js";
 import { listMatterDocuments } from "../documents/index.js";
+import { kindPriority } from "../documents/classify.js";
 import { addMatterEvent } from "../repo/index.js";
 import {
   EXTRACTION_SYSTEM,
@@ -27,8 +28,9 @@ import {
   type RawWindow,
 } from "./extract.js";
 
-const MAX_DOCUMENTS = 12;
-const MAX_TOTAL_WINDOWS = 30;
+// A criminal file runs to dozens of documents. The build is resumable, so a larger limit costs time, not reliability.
+const MAX_DOCUMENTS = 40;
+const MAX_TOTAL_WINDOWS = 120;
 const DEFAULT_BUDGET_MS = 100_000;
 const CALL_TIMEOUT_MS = 80_000;
 
@@ -112,7 +114,7 @@ async function askWindow(documentName: string, windowText: string): Promise<RawW
     try {
       const res = await client.chat.completions.create(
         {
-          model: config.customLlmModel,
+          model: llmModel(),
           messages,
           temperature: 0,
           max_tokens: 900,
@@ -181,12 +183,19 @@ export async function getCaseFile(userId: string, matterId: string): Promise<Cas
 
 /** Lists what will be read and what cannot be, and queues every window. */
 async function plan(userId: string, matterId: string): Promise<{ progress: Progress; skipped: Array<{ name: string; reason: string }> }> {
-  const docs = await listMatterDocuments(userId, matterId);
+  const all = await listMatterDocuments(userId, matterId);
+  // Read the record of events (FIR, statements, reports) before the paperwork around it, so a build cut short by the limits loses the least.
+  const docs = [...all].sort((a, b) => kindPriority(a.kind ?? "other") - kindPriority(b.kind ?? "other") || a.createdAt - b.createdAt);
   const skipped: Array<{ name: string; reason: string }> = [];
   const queue: Progress["queue"] = [];
   let readable = 0;
 
   for (const doc of docs) {
+    if (doc.duplicateOf) {
+      const original = all.find((d) => d.id === doc.duplicateOf);
+      skipped.push({ name: doc.name, reason: `Same text as "${original?.name ?? "an earlier upload"}", so it was read once.` });
+      continue;
+    }
     if (doc.status !== "ready") {
       skipped.push({ name: doc.name, reason: doc.note || "No readable text was found. A scanned document or photo needs OCR first." });
       continue;

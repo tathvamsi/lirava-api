@@ -1,0 +1,22 @@
+# systemd USER unit. Install:  cp markitdown-svc.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#                              systemctl --user enable --now markitdown-svc
+# Needs MARKITDOWN_KEY in ~/.markitdown.env (chmod 600), one line:  MARKITDOWN_KEY=<at least 24 random characters>
+[Unit]
+Description=Lirava document conversion service (MarkItDown)
+After=network.target
+
+[Service]
+EnvironmentFile=%h/.markitdown.env
+Environment=MARKITDOWN_HOST=127.0.0.1
+Environment=MARKITDOWN_PORT=8085
+# The libraries are installed into ~/markitdown-service/lib (pip --target), so no system package or venv is needed.
+Environment=PYTHONPATH=%h/markitdown-service/lib
+WorkingDirectory=%h/markitdown-service
+ExecStart=/usr/bin/python3 app.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

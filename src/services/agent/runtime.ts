@@ -30,10 +30,9 @@ import {
 } from "./context-budget.js";
 import { maybeSummarizeChat, toTurn } from "./summary.js";
 import { classifySmallTalk, smallTalkReply } from "./smalltalk.js";
-import { decideRetrieval } from "./retrieval-gate.js";
+import { decideRetrieval, hasLegalSignal } from "./retrieval-gate.js";
 import { config } from "../../config.js";
-import { generateLegalResponse } from "../legal/knowledge.js";
-import { OFFLINE_NOTICE } from "../legal/notice.js";
+import { MODEL_UNAVAILABLE_MESSAGE } from "../legal/notice.js";
 import { retrieveLegalContext } from "../legal/rag.js";
 import { getAgentPersonaPrompt } from "./personas.js";
 import { routeLegalTask, type RoutingDecision } from "./router.js";
@@ -41,7 +40,10 @@ import { extractTextFromFile, type Attachment } from "../files/index.js";
 import { isImageName, loadImageParts, type ImagePart } from "./vision.js";
 import crypto from "node:crypto";
 import { RunQueue } from "./queue.js";
-import { languageSection } from "./language.js";
+import { detectLanguage, languageAnswer, languageAnsweredTask, languageSection } from "./language.js";
+import { activeProvider, defaultProvider, llmModel, providerFor, publicProviders, withProvider, type Provider } from "./providers.js";
+import { intakeMessage, intakeReplyTo, intakeTask, isThinReply, matterFactsBrief, planIntake } from "./intake.js";
+import { getCaseFile } from "../casefile/index.js";
 import { getPreferences } from "../preferences/index.js";
 import { CLARIFY_ANSWERED, decideClarify, hasAskBlock, isAnswersMessage, plainAsk, withAnsweredNote } from "./clarify.js";
 import { classifyOutput, modeDirective } from "./output-mode.js";
@@ -115,12 +117,23 @@ export function runningFor(userId: string): Record<string, "queued" | "running">
 const runQueue = new RunQueue(Number(process.env.MAX_CONCURRENT_RUNS || 4), Number(process.env.MAX_RUNS_PER_USER || 2));
 
 /** How many times a cut-off answer is continued, and the least room worth continuing in. */
-const MAX_CONTINUATIONS = Number(process.env.MAX_CONTINUATIONS || 2);
+const MAX_CONTINUATIONS = Number(process.env.MAX_CONTINUATIONS || 4);
 const MIN_CONTINUE_TOKENS = 150;
+/** No answer is allowed past this size, however many continuations it asks for. */
+const MAX_ANSWER_CHARS = 24_000;
+
+/** A failure worth one more try: a busy server, a rate limit, a dropped connection or a timeout. */
+const isTransient = (e: any) => e?.status === 429 || (typeof e?.status === "number" && e.status >= 500) || /ECONNRESET|ETIMEDOUT|fetch failed|Connection error|timed? ?out|socket hang up/i.test(String(e?.message ?? ""));
 
 // If the model server reports a smaller window than configured, that is used from then on.
-let learnedWindow: number | null = null;
-const currentWindow = () => Math.min(config.contextWindowTokens, learnedWindow ?? Number.POSITIVE_INFINITY);
+// It is remembered per provider: one provider's small window must not shrink another's.
+const learnedWindows = new Map<string, number>();
+const currentWindow = () => {
+  const p = activeProvider();
+  return Math.min(p.window, learnedWindows.get(p.id) ?? Number.POSITIVE_INFINITY);
+};
+/** Fields some providers want on every chat request (for example Sarvam's reasoning setting). */
+const extraBody = (): object => activeProvider().body;
 
 export function abortRun(vakilId: string, userId: string, conversationId?: string): boolean {
   let stopped = false;
@@ -142,7 +155,7 @@ export async function sendMessage(
   conversationId?: string,
   clientMsgId?: string,
   attachments?: Attachment[],
-  options: { background?: boolean } = {},
+  options: { background?: boolean; provider?: Provider } = {},
 ): Promise<{ userMessage: MessageRecord; assistantMessage?: MessageRecord }> {
   if (!userId) throw new ChatError(401, "Sign in required.");
   // Resolve the conversation. It must belong to this user: someone else's id is
@@ -243,7 +256,7 @@ export async function sendMessage(
   runState.abortController = abortController;
   runState.currentStep = 1;
 
-  const generate = async (): Promise<{ userMessage: MessageRecord; assistantMessage?: MessageRecord }> => {
+  const generateInner = async (): Promise<{ userMessage: MessageRecord; assistantMessage?: MessageRecord }> => {
   // 2. Chat history. Older messages live on as a running summary saved with the chat; the messages after it are
   // loaded here (this user's own conversation only) and the newest ones that fit the model's window are used.
   const { summary: chatSummary, history: historyRows } = await getChatContext(conversationId, userId, userMsg.id, 40);
@@ -289,7 +302,7 @@ export async function sendMessage(
 
   // Images: a vision model is sent them with the question; any other model is told plainly it cannot read them.
   if (imageFiles.length > 0) {
-    if (config.visionEnabled) {
+    if (activeProvider().vision) {
       const loaded = await loadImageParts(imageFiles, userId);
       imageParts = loaded.parts;
       imageNames = loaded.names;
@@ -304,14 +317,40 @@ export async function sendMessage(
 
     // Before answering, check whether something essential is missing. If so, the reply is a question card
     // the user answers with a click, and the answer itself waits for those answers (see clarify.ts).
+    // A bail petition has a fixed checklist (who it is for, which court, what the case is, arrest and custody) that is
+    // checked against the matter and the case file, and only what is missing is asked (see intake.ts).
+    const caseFile = matterId ? await withTimeout(getCaseFile(userId, matterId).then((v) => v?.content ?? null).catch(() => null), 3000, null) : null;
+    const savedLanguageEarly = await withTimeout(getPreferences(userId).then((p) => p.documentLanguage).catch(() => undefined), 1500, undefined);
+    const intakeReply = intakeReplyTo(cleanHistory, userText);
+    const intakePlan =
+      (attachments?.length ?? 0) > 0 || isAnswersMessage(userText)
+        ? null
+        : planIntake({
+            request: intakeReply?.original ?? userText,
+            history: intakeReply ? [...cleanHistory, { role: "user", content: userText }] : cleanHistory,
+            matter: matter ? { title: matter.title, client: matter.client, court: matter.court, notes: matter.notes, intake: matter.intake } : null,
+            caseFile,
+            savedLanguage: savedLanguageEarly,
+          });
+    let intakeAsk: string | null = null;
+    // A reply that only repeats the request is not the details: ask once more, then write with placeholders.
+    if (intakePlan?.missing.length && (!intakeReply || (isThinReply(userText, intakeReply.original) && intakeReply.asked < 2))) {
+      intakeAsk = intakeMessage(intakePlan, { again: Boolean(intakeReply) });
+    }
+    const intakeDone = Boolean(intakePlan) && !intakeAsk;
+
     console.log("[Clarify] checking whether anything essential is missing");
-    const askText = await decideClarify({
-      userText,
-      history: cleanHistory,
-      hasAttachments: (attachments?.length ?? 0) > 0,
-      matterBrief: matter ? `${matter.title}${matter.client ? `, client ${matter.client}` : ""}${matter.court ? `, ${matter.court}` : ""}. ${(matter.notes || "").slice(0, 600)}` : undefined,
-      signal: abortController.signal,
-    });
+    const askText =
+      intakeAsk ??
+      (intakePlan || intakeReply
+        ? null
+        : await decideClarify({
+            userText,
+            history: cleanHistory,
+            hasAttachments: (attachments?.length ?? 0) > 0,
+            matterBrief: matter ? `${matter.title}${matter.client ? `, client ${matter.client}` : ""}${matter.court ? `, ${matter.court}` : ""}. ${(matter.notes || "").slice(0, 600)}` : undefined,
+            signal: abortController.signal,
+          }));
     if (askText && !abortController.signal.aborted) {
       const askTime = Date.now();
       const askMsg: MessageRecord = {
@@ -346,8 +385,15 @@ export async function sendMessage(
     // An answer to a question card is turned back into the original request plus the facts given, so routing,
     // the legal search and the model all work from a real task (see clarify.ts).
     const answering = isAnswersMessage(userText);
-    const originalRequest = answering ? [...cleanHistory].reverse().find((t) => t.role === "user" && !isAnswersMessage(t.content))?.content : undefined;
-    const taskText = answering ? withAnsweredNote(userText, originalRequest) : userText;
+    // The same goes for the plain-text "Which language should I write this in?": the short reply carries on the request it answers.
+    const langAnswer = answering ? null : languageAnswer(userText, cleanHistory);
+    const originalRequest = answering ? [...cleanHistory].reverse().find((t) => t.role === "user" && !isAnswersMessage(t.content))?.content : (intakeDone ? intakeReply?.original : undefined) ?? langAnswer?.original;
+    // A bail petition is written from the request, what the file holds and the lawyer's details together.
+    const intakeTaskText =
+      intakeDone && intakePlan
+        ? intakeTask({ original: intakeReply?.original ?? userText, known: intakePlan.known, details: intakeReply ? userText : undefined, language: detectLanguage(userText) })
+        : null;
+    const taskText = answering ? withAnsweredNote(userText, originalRequest) : intakeTaskText ?? (langAnswer ? languageAnsweredTask(langAnswer) : userText);
     // A plan or strategy opens as an artifact, a notice or draft in the document editor (see output-mode.ts).
     const outputMode = classifyOutput(originalRequest ?? userText);
 
@@ -369,14 +415,18 @@ export async function sendMessage(
     const gate = decideRetrieval({
       text: taskText,
       hasAttachments: (attachments?.length ?? 0) > 0,
+      onlyImages: (attachments?.length ?? 0) > 0 && (attachments ?? []).every((a) => isImageName(a.name)),
       inMatter: Boolean(conversation.matterId) || knowledgeIds.length > 0,
       recent: cleanHistory.map((m) => m.content),
     });
     console.log(`\x1b[35m[RetrievalGate]\x1b[0m 🧭 statutes=${gate.statutes ? "search" : "skip"}, documents=${gate.documents ? "search" : "skip"} (${gate.reason})`);
     // The statute library (vector + text search) and the user's own documents are independent, so they are searched
     // at the same time; each has its own time limit and falls back to "nothing found" rather than stalling the answer.
+    // A short follow-up ("and what if he was a minor?") is searched together with the legal question it follows.
+    const priorLegal = gate.reason === "follow-up" ? [...cleanHistory].reverse().find((m) => m.role === "user" && hasLegalSignal(m.content))?.content : undefined;
+    const searchText = priorLegal ? `${priorLegal.slice(0, 300)} ${taskText}` : taskText;
     const [ragResult, documentHits] = await Promise.all([
-      gate.statutes ? withTimeout(retrieveLegalContext(taskText).catch(() => null), config.upstreamTimeoutMs * 2, null) : Promise.resolve(null),
+      gate.statutes ? withTimeout(retrieveLegalContext(searchText).catch(() => null), config.upstreamTimeoutMs * 2, null) : Promise.resolve(null),
       gate.documents
         ? withTimeout(
             searchDocuments(userId, { conversationId, matterId: conversation.matterId ?? null, knowledgeIds }, taskText, 5).catch(() => [] as DocumentHit[]),
@@ -454,7 +504,11 @@ export async function sendMessage(
     if (unreadableImages.length > 0) {
       sections.push({
         id: "images",
-        text: `The user attached image file(s) (${unreadableImages.join(", ")}) that this system cannot read. Do not describe or guess their contents. Tell the user plainly that image attachments are not readable yet and ask them to upload the document as a PDF or Word file, or paste the text, then answer anything else in their message.`,
+        text: (() => {
+          const canRead = publicProviders().filter((p) => p.available && p.vision && p.id !== activeProvider().id).map((p) => p.label);
+          const switchTo = canRead.length ? `Tell the user to choose ${canRead.join(" or ")} in the model picker beside the message box (those models can read images), then send the image again. ` : "";
+          return `The user attached image file(s) (${unreadableImages.join(", ")}), but the selected model (${activeProvider().label}) cannot read images. Do not describe or guess their contents. Tell the user plainly that ${activeProvider().label} cannot read images. ${switchTo}Or they can upload the document as a PDF or Word file, or paste the text. Then answer anything else in their message.`;
+        })(),
         floorTokens: 60,
         shedOrder: 90,
       });
@@ -463,7 +517,7 @@ export async function sendMessage(
     if (matter) {
       sections.push({
         id: "matter",
-        text: `CURRENT MATTER CONTEXT:\nMatter: ${matter.title}\nClient: ${matter.client || "Not recorded"}\nCourt / forum: ${matter.court || "Not recorded"}\nMatter notes: ${(matter.notes || "None recorded").slice(0, 1500)}`,
+        text: `CURRENT MATTER CONTEXT:\nMatter: ${matter.title}\nClient: ${matter.client || "Not recorded"}\nCourt / forum: ${matter.court || "Not recorded"}\nMatter notes: ${(matter.notes || "None recorded").slice(0, 1500)}${matterFactsBrief(matter, caseFile) ? `\n${matterFactsBrief(matter, caseFile)}` : ""}`,
         tail: `Keep this matter context in mind, but do not invent facts not supplied by the user or sources.`,
         floorTokens: 120,
         shedOrder: 30,
@@ -471,8 +525,8 @@ export async function sendMessage(
     }
 
     // Which language documents are written in: the user's saved default, or the rule to ask first (see language.ts).
-    const savedLanguage = await withTimeout(getPreferences(userId).then((p) => p.documentLanguage).catch(() => undefined), 1500, undefined);
-    sections.push({ id: "language", text: languageSection(savedLanguage), floorTokens: 120, shedOrder: 96 });
+    const savedLanguage = savedLanguageEarly; // already read before the checklist step
+    sections.push({ id: "language", text: languageSection(savedLanguage, { documentRequest: outputMode === "document" }), floorTokens: 120, shedOrder: 96 });
 
     if (chatSummary) {
       sections.push({
@@ -493,7 +547,7 @@ export async function sendMessage(
 
     // Each image takes a share of the window, so the text is fitted into what is left.
     const imageReserve = imageParts.length * config.imageTokens;
-    const fitted = fitPrompt({ sections, history: modelHistory, userText: modelUserText, windowTokens: Math.max(1024, currentWindow() - imageReserve), answerTokens: config.answerMaxTokens });
+    const fitted = fitPrompt({ sections, history: modelHistory, userText: modelUserText, windowTokens: Math.max(1024, currentWindow() - imageReserve), answerTokens: activeProvider().answerMax });
     // The images travel with the user's message (the last one), which becomes text plus image parts.
     const messages = (imageParts.length > 0
       ? fitted.messages.map((m, i, all) => (i === all.length - 1 && m.role === "user" ? { ...m, content: [{ type: "text", text: m.content }, ...imageParts] } : m))
@@ -522,6 +576,7 @@ export async function sendMessage(
     let reasoningBuffer = "";
     let hasReceivedContent = false;
     let assistantText = "";
+    let loopGuardAt = 0;
     const llmStartTime = Date.now();
     let initialMessageEmitted = false;
 
@@ -557,6 +612,19 @@ export async function sendMessage(
             assistantText += text;
             emit({ type: "message_delta", id: asstMsgId, vakilId, userId, delta: text });
           }
+
+          // A small model can get stuck and write the same clause again and again. When the latest stretch of text already
+          // appears earlier in the answer, stop here and keep the first copy, instead of letting it run to the length limit.
+          if (assistantText.length - loopGuardAt >= 300) {
+            loopGuardAt = assistantText.length;
+            const tail = assistantText.slice(-120);
+            if (assistantText.slice(0, -120).includes(tail)) {
+              console.warn(`[33m[AgentRuntime][0m 🔁 The model started repeating itself; stopping the answer at the first copy`);
+              assistantText = endAtSentence(assistantText.slice(0, assistantText.indexOf(tail) + tail.length));
+              generatedContent = assistantText;
+              return "stop";
+            }
+          }
         }
       }
       return finish;
@@ -569,41 +637,94 @@ export async function sendMessage(
     };
 
     try {
-      console.log(`\x1b[34m[AgentRuntime]\x1b[0m 🧠 Dispatching streaming LLM request to (${config.customLlmBaseUrl}) for sub-agent ${targetSubAgent}...`);
-      const stream = await openai.chat.completions.create(
-        {
-          model: config.customLlmModel,
-          messages,
-          temperature: 0.3,
-          max_tokens: Math.max(256, fitted.maxAnswerTokens),
-          stream: true,
-        },
-        { signal: abortController.signal, timeout: 120000 }
-      );
+      console.log(`\x1b[34m[AgentRuntime]\x1b[0m 🧠 Dispatching streaming LLM request to (${activeProvider().baseURL}) for sub-agent ${targetSubAgent}...`);
+      const open = () =>
+        openai.chat.completions.create(
+          {
+            model: llmModel(),
+            messages,
+            temperature: 0.3,
+            max_tokens: Math.max(256, fitted.maxAnswerTokens),
+            stream: true,
+            ...extraBody(),
+          },
+          { signal: abortController.signal, timeout: 120000 },
+        );
+      // A hosted provider can fail for a moment (a busy server, a dropped connection): one more try before giving up.
+      let stream;
+      try {
+        stream = await open();
+      } catch (e: any) {
+        if (!activeProvider().hosted || abortController.signal.aborted || !isTransient(e)) throw e;
+        console.warn(`[33m[AgentRuntime][0m ⏳ ${activeProvider().label} failed for a moment (${String(e?.message).slice(0, 80)}); trying once more`);
+        await new Promise((r) => setTimeout(r, 1500));
+        stream = await open();
+      }
 
       let finish = await consume(stream);
+      // A hosted model that answers with nothing at all is asked once more.
+      if (!assistantText.trim() && activeProvider().hosted && !abortController.signal.aborted && finish !== "length") {
+        console.warn(`[33m[AgentRuntime][0m ⏳ ${activeProvider().label} sent an empty reply; trying once more`);
+        finish = await consume(await open());
+      }
 
-      // The answer hit its length limit before it was finished: ask the model to carry on from where it stopped,
-      // as long as the window still has room. The prompt prefix is the same, so the server reuses its cache.
+      // A reasoning model can spend the whole answer budget thinking and send no text. Try once more with reasoning off.
+      if (finish === "length" && !assistantText.trim() && "reasoning_effort" in extraBody() && (extraBody() as { reasoning_effort?: unknown }).reasoning_effort !== null) {
+        console.warn(`[33m[AgentRuntime][0m 🧠 The model used its whole answer budget thinking and wrote nothing; trying again with reasoning off`);
+        const again = await openai.chat.completions.create(
+          { model: llmModel(), messages, temperature: 0.3, max_tokens: Math.max(256, fitted.maxAnswerTokens), stream: true, ...extraBody(), reasoning_effort: null },
+          { signal: abortController.signal, timeout: 120000 },
+        );
+        finish = await consume(again);
+      }
+
+      // The answer hit its length limit before it was finished: ask the model to carry on from where it stopped.
+      // First with the same prompt (the server reuses its cache). When the window has no room for that, with a much
+      // smaller prompt (no chat history, every section at its minimum), which frees most of the window for the answer.
       let continuations = 0;
-      while (finish === "length" && assistantText.trim() && continuations < MAX_CONTINUATIONS && !abortController.signal.aborted) {
+      // A document may need several continuations; a plain question should not run on, and no answer grows without bound.
+      const continuationLimit = outputMode ? MAX_CONTINUATIONS : Math.min(2, MAX_CONTINUATIONS);
+      while (finish === "length" && assistantText.trim() && continuations < continuationLimit && assistantText.length < MAX_ANSWER_CHARS && !abortController.signal.aborted) {
         const window = currentWindow();
-        const used = fitted.promptTokens + estimateTokens(assistantText) + estimateTokens(CONTINUE_PROMPT) + 24;
-        const room = Math.min(config.answerMaxTokens, window - used - safetyTokens(window));
+        const tail = estimateTokens(assistantText) + estimateTokens(CONTINUE_PROMPT) + 24;
+        let base = messages;
+        let room = Math.min(activeProvider().answerMax, window - (fitted.promptTokens + tail) - safetyTokens(window));
+        if (room < MIN_CONTINUE_TOKENS) {
+          const compact = fitPrompt({
+            sections,
+            history: [],
+            userText: modelUserText,
+            windowTokens: Math.max(1024, window - tail),
+            answerTokens: Math.min(activeProvider().answerMax, 1200),
+            minimal: true,
+          });
+          base = compact.messages;
+          room = Math.min(activeProvider().answerMax, window - (compact.promptTokens + tail) - safetyTokens(window));
+          if (room >= MIN_CONTINUE_TOKENS) console.log(`\x1b[34m[AgentRuntime]\x1b[0m ✂️ Continuing with a smaller prompt to make room (${compact.promptTokens} tokens)`);
+        }
         if (room < MIN_CONTINUE_TOKENS) break;
         continuations++;
         console.log(`\x1b[34m[AgentRuntime]\x1b[0m ↪️ Answer hit its length limit; continuing (${continuations}/${MAX_CONTINUATIONS}, room for ${room} tokens)`);
         const next = await openai.chat.completions.create(
           {
-            model: config.customLlmModel,
-            messages: [...messages, { role: "assistant" as const, content: assistantText }, { role: "user" as const, content: CONTINUE_PROMPT }],
+            model: llmModel(),
+            messages: [...base, { role: "assistant" as const, content: assistantText }, { role: "user" as const, content: CONTINUE_PROMPT }],
             temperature: 0.3,
             max_tokens: room,
             stream: true,
+            ...extraBody(),
           },
           { signal: abortController.signal, timeout: 120000 },
         );
+        const before = assistantText.length;
         finish = await consume(next);
+        // A model that starts over repeats what it already wrote: keep the first copy and stop.
+        const probe = assistantText.slice(before).trim().slice(0, 120);
+        if (probe.length >= 80 && assistantText.slice(0, before).includes(probe)) {
+          console.warn(`[33m[AgentRuntime][0m 🔁 The continuation repeated earlier text; stopping there`);
+          assistantText = endAtSentence(assistantText.slice(0, before));
+          finish = "stop";
+        }
       }
       // Still not finished (no room left): end at a full sentence and tell the user how to get the rest.
       if (finish === "length") {
@@ -631,7 +752,7 @@ export async function sendMessage(
       // The server says how big its window really is when a prompt does not fit: remember it for every later request.
       const reportedWindow = windowFromError(llmErr.message);
       if (reportedWindow && reportedWindow < currentWindow()) {
-        learnedWindow = reportedWindow;
+        learnedWindows.set(activeProvider().id, reportedWindow);
         console.warn(`\x1b[33m[AgentRuntime]\x1b[0m 📐 The model server's window is ${reportedWindow} tokens; using that from now on.`);
       }
 
@@ -649,12 +770,12 @@ export async function sendMessage(
             history: [],
             userText: modelUserText,
             windowTokens: Math.floor(currentWindow() * 0.85),
-            answerTokens: Math.min(config.answerMaxTokens, 900),
+            answerTokens: Math.min(activeProvider().answerMax, 900),
             minimal: true,
           });
           const retryStream = await openai.chat.completions.create(
             {
-              model: config.customLlmModel,
+              model: llmModel(),
               messages: small.messages,
               temperature: 0.3,
               max_tokens: Math.max(256, small.maxAnswerTokens),
@@ -673,9 +794,9 @@ export async function sendMessage(
       }
 
       if (!generatedContent.trim()) {
-        console.warn(`\x1b[33m[AgentRuntime] ⚠️ LLM inference node offline at ${config.customLlmBaseUrl} (${llmErr.message}). Engaging Lirava Legal Knowledge Engine fallback.\x1b[0m`);
-        const fallbackText = OFFLINE_NOTICE + generateLegalResponse(userText);
-        // This text is a general reference, not an answer drawn from the retrieved sources, so it carries none.
+        console.warn(`\x1b[33m[AgentRuntime] ⚠️ LLM inference node offline at ${activeProvider().baseURL} (${llmErr.message}). Telling the user the model is unavailable.\x1b[0m`);
+        // No canned legal text stands in for the model: it could be mistaken for advice, or saved as a document.
+        const fallbackText = MODEL_UNAVAILABLE_MESSAGE;
         citations = [];
         asstMsg.citations = null;
         assistantText = fallbackText;
@@ -699,12 +820,10 @@ export async function sendMessage(
     }
 
     if (!assistantText) {
-      console.warn(`\x1b[33m[AgentRuntime] ⚠️ LLM returned empty response. Engaging Lirava Legal Knowledge Engine fallback.\x1b[0m`);
-      const fallbackText = OFFLINE_NOTICE + generateLegalResponse(userText);
-        // This text is a general reference, not an answer drawn from the retrieved sources, so it carries none.
-        citations = [];
-        asstMsg.citations = null;
-      assistantText = fallbackText;
+      console.warn(`\x1b[33m[AgentRuntime] ⚠️ LLM returned empty response. Telling the user the model is unavailable.\x1b[0m`);
+      citations = [];
+      asstMsg.citations = null;
+      assistantText = MODEL_UNAVAILABLE_MESSAGE;
       if (!initialMessageEmitted) {
         emit({ type: "message", vakilId, userId, data: { ...asstMsg, text: assistantText } });
       } else {
@@ -713,10 +832,12 @@ export async function sendMessage(
     }
 
     asstMsg.text = assistantText;
+    // When the model could not answer, the message says so and that is all: no retry, no citation check, no document, no matter note.
+    const modelUnavailable = assistantText === MODEL_UNAVAILABLE_MESSAGE;
 
     // The model refused a request for a document or plan ("please share the section first"): try once more with
     // a short prompt that orders it to write the work with placeholders. The final message below replaces the text.
-    if (outputMode && !abortController.signal.aborted && looksLikeRefusal(assistantText)) {
+    if (!modelUnavailable && outputMode && !abortController.signal.aborted && looksLikeRefusal(assistantText)) {
       console.log("[Output] the model refused to write the work; trying once more without the search results");
       const redone = await writeWithoutRefusing({ mode: outputMode, task: taskText, persona: getAgentPersonaPrompt(vakilId, targetSubAgent), signal: abortController.signal });
       if (redone) {
@@ -729,7 +850,7 @@ export async function sendMessage(
     // a citation is "verified" only when it matches a library record. The result travels beside the answer as its own
     // event (not mixed into `citations`), and a failed or slow check never holds the answer back.
     try {
-      const check = await withTimeout(verifyAnswer(assistantText, new PgLibraryStore()).catch(() => null), config.upstreamTimeoutMs, null);
+      const check = modelUnavailable ? null : await withTimeout(verifyAnswer(assistantText, new PgLibraryStore()).catch(() => null), config.upstreamTimeoutMs, null);
       if (check && check.verdicts.length > 0) {
         console.log(`\x1b[35m[CitationCheck]\x1b[0m ⚖️ ${check.counts.verified} verified, ${check.counts.partial} partly, ${check.counts.unverified} not in the library`);
         emit({ type: "citation_check", vakilId, userId, data: { messageId: asstMsg.id, ...check } });
@@ -751,10 +872,10 @@ export async function sendMessage(
     await touchConversation(conversationId, userId);
     // The finished plan or document is saved as an artifact (which opens beside the chat) and the chat shows it
     // as a card. If saving fails, the answer simply stays as chat text.
-    if (outputMode && !hasAskBlock(asstMsg.text)) {
-      await createOutputArtifact({ mode: outputMode, text: asstMsg.text, userId, vakilId, conversationId, messageId: asstMsg.id });
+    if (outputMode && !modelUnavailable && !hasAskBlock(asstMsg.text)) {
+      await createOutputArtifact({ mode: outputMode, text: asstMsg.text, userId, vakilId, conversationId, messageId: asstMsg.id, request: originalRequest ?? userText, matterTitle: matter?.title ?? null });
     }
-    if (matterId && !hasAskBlock(asstMsg.text)) void noteMatterAnswered(matterId, userId, conversationId, asstMsg.text).catch(() => undefined);
+    if (matterId && !modelUnavailable && !hasAskBlock(asstMsg.text)) void noteMatterAnswered(matterId, userId, conversationId, asstMsg.text).catch(() => undefined);
 
     // After the answer is saved (so the user never waits for it): fold older messages into the chat's summary
     // once they no longer fit in the window.
@@ -784,6 +905,11 @@ export async function sendMessage(
     throw err;
   }
   };
+
+  // The whole answer runs with the provider the user chose (or the server default), however long it waits in the queue.
+  // A message with an image uses the provider's image model when the chosen one cannot read images (Sarvam: gemma4).
+  const provider = providerFor(options.provider ?? defaultProvider(), (attachments ?? []).some((a) => isImageName(a.name)));
+  const generate = () => withProvider(provider, generateInner);
 
   const announce = (status: RunState["phase"]) => {
     runState.phase = status;

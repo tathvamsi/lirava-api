@@ -6,9 +6,10 @@
 import { saveArtifact } from "../repo/index.js";
 import { generateDocumentPdf, UnsupportedTextError } from "../legal/documents.js";
 import { saveFile } from "../files/index.js";
-import { cleanOutput, modeDirective, titleOf, type OutputMode } from "./output-mode.js";
+import { cleanOutput, modeDirective, type OutputMode } from "./output-mode.js";
+import { documentTitle, tidyDocument } from "./document-layout.js";
 import { getLlmClient } from "./client.js";
-import { config } from "../../config.js";
+import { activeProvider, llmModel } from "./providers.js";
 
 /** Shorter than this is a reply, not a document or a plan. */
 const MIN_CHARS = 400;
@@ -28,7 +29,7 @@ export async function writeWithoutRefusing(input: { mode: OutputMode; task: stri
   try {
     const response = await getLlmClient().chat.completions.create(
       {
-        model: config.customLlmModel,
+        model: llmModel(),
         messages: [
           {
             role: "system",
@@ -37,7 +38,7 @@ export async function writeWithoutRefusing(input: { mode: OutputMode; task: stri
           { role: "user", content: input.task },
         ],
         temperature: 0.3,
-        max_tokens: config.answerMaxTokens,
+        max_tokens: activeProvider().answerMax,
       },
       { signal: input.signal, timeout: 120000 },
     );
@@ -58,11 +59,14 @@ export async function createOutputArtifact(input: {
   vakilId: string;
   conversationId: string;
   messageId: string;
+  /** What the user asked for, and the matter it belongs to: they name the paper better than its opening words do. */
+  request?: string;
+  matterTitle?: string | null;
 }): Promise<{ id: string } | null> {
   try {
-    const content = cleanOutput(input.text);
+    const content = tidyDocument(cleanOutput(input.text));
     if (content.length < MIN_CHARS) return null;
-    const title = titleOf(content, input.mode);
+    const title = documentTitle({ content, mode: input.mode, request: input.request, matterTitle: input.matterTitle });
     const filename = `${title.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 50) || "document"}.pdf`;
 
     // A document gets its PDF up front so it can be downloaded at once; a plan is read on screen.

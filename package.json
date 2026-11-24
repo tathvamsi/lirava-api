@@ -19,7 +19,7 @@
     ]
   },
   "dependencies": {
-    "@composio/core": "0.27.0",
+    "@composio/core": "0.30.0",
     "@hono/node-server": "^1.13.8",
     "@qdrant/js-client-rest": "^1.19.0",
     "bcryptjs": "^3.0.3",

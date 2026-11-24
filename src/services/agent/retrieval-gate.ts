@@ -11,7 +11,7 @@
  */
 import { classifySmallTalk } from "./smalltalk.js";
 
-export type GateReason = "small-talk" | "legal" | "attachments" | "matter" | "follow-up" | "non-english" | "general" | "gate-off";
+export type GateReason = "small-talk" | "translation" | "legal" | "image" | "attachments" | "matter" | "follow-up" | "non-english" | "general" | "gate-off";
 
 export interface GateDecision {
   /** Search the statute library. */
@@ -25,6 +25,8 @@ export interface GateInput {
   text: string;
   /** Files attached to this message. */
   hasAttachments: boolean;
+  /** Every attached file is an image. An image is read by the model itself, not searched, so it is no reason to search the library. */
+  onlyImages?: boolean;
   /** The chat belongs to a case (its documents and notes are part of the question). */
   inMatter: boolean;
   /** The last few messages of the chat, newest last. */
@@ -59,6 +61,9 @@ const LEGAL_STEMS = [
 ];
 const LEGAL_SIGNAL = new RegExp(`(?:^|[^a-z])(?:${LEGAL_STEMS.join("|")})`, "i");
 
+const TRANSLATION_TASK = /^\s*(?:please\s+)?(?:translate|translation\s+of|transliterate|rewrite|rephrase|paraphrase|proofread|correct\s+(?:the\s+)?(?:grammar|spelling))\b/i;
+const NAMES_A_LAW = /section\s*\d|sec\.?\s*\d|article\s*\d|\b(?:bns|bnss|bsa|ipc|crpc|cpc)\b|\bact,?\s+(?:19|20)\d\d/i;
+
 export const hasLegalSignal = (text: string): boolean => LEGAL_SIGNAL.test(text);
 
 /** Hindi and other scripts have no English legal words to match, so they are treated as possibly legal. */
@@ -80,9 +85,16 @@ export function decideRetrieval(input: GateInput): GateDecision {
   if (classifySmallTalk(text)) return none("small-talk");
 
   if (process.env.RETRIEVAL_GATE === "off") return all("gate-off");
+  // Translating or rewording text is about language, not law: "translate: the hearing is adjourned" must not pull statutes
+  // because it contains the word "hearing". A named section or Act in it ("translate Section 482 BNSS") still searches.
+  if (TRANSLATION_TASK.test(text) && !NAMES_A_LAW.test(text)) return none("translation");
   if (hasLegalSignal(text)) return all("legal");
-  if (input.hasAttachments) return all("attachments");
-  if (input.inMatter) return all("matter");
+  // "explain this image" has nothing for a search to match: the picture goes to the model, and statutes found for those
+  // words would only be attached as unrelated "sources". Words about law in the message still search (the rule above).
+  if (input.hasAttachments && input.onlyImages) return none("image");
+  // The user's own papers answer a question about them. Statutes found for plain words like "summarise this" are unrelated.
+  if (input.hasAttachments) return { statutes: false, documents: true, reason: "attachments" };
+  if (input.inMatter) return { statutes: false, documents: true, reason: "matter" };
   if (mostlyNonLatin(text)) return all("non-english");
   // A short follow-up in a legal chat ("and what if he was a minor?") belongs to the same subject.
   if (wordCount(text) >= 4 && (input.recent ?? []).slice(-4).some(hasLegalSignal)) return all("follow-up");

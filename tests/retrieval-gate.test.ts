@@ -61,12 +61,20 @@ describe("retrieval gate: anything legal still searches (a wrong skip is worse t
 
   it("searches when a file is attached, even if the words are plain", () => {
     const d = ask("Please summarise this", { hasAttachments: true });
-    assert.deepEqual([d.statutes, d.documents, d.reason], [true, true, "attachments"]);
+    assert.deepEqual([d.statutes, d.documents, d.reason], [false, true, "attachments"], "the papers are searched; statutes found for plain words would be unrelated");
+  });
+
+  it("searches nothing for a plain question about an attached image, which the model reads itself", () => {
+    const d = ask("explain this image", { hasAttachments: true, onlyImages: true });
+    assert.deepEqual([d.statutes, d.documents, d.reason], [false, false, "image"]);
+    // Legal words in the message still search, and a document next to the image still does.
+    assert.equal(ask("Is this FIR valid under section 173 BNSS?", { hasAttachments: true, onlyImages: true }).statutes, true);
+    assert.deepEqual([ask("explain this", { hasAttachments: true, onlyImages: false }).reason], ["attachments"]);
   });
 
   it("searches inside a case, where its documents and notes are part of the question", () => {
     const d = ask("Who is the second person named in it?", { inMatter: true });
-    assert.deepEqual([d.statutes, d.documents, d.reason], [true, true, "matter"]);
+    assert.deepEqual([d.statutes, d.documents, d.reason], [false, true, "matter"]);
   });
 
   it("searches for a Hindi question, which has no English legal words to match", () => {

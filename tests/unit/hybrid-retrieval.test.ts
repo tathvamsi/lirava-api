@@ -43,7 +43,10 @@ describe("RAG: Hybrid Retrieval Engine & Fault Tolerance", () => {
 
       // Verify formatted output structure
       assert.match(res.contextText, /\[PROVISION\]/);
-      assert.ok(res.sources.some((s) => s.section && s.section.includes("482")));
+      // A bail provision is among them, and a precedent travels with it. (Which bail section ranks first depends on the search
+      // scores, which are meaningless with the offline mock vectors, so any of the bail sections of the BNSS counts.)
+      assert.ok(res.sources.some((s) => s.section && /\b48[0-3]\b/.test(s.section)));
+      assert.ok(res.sources.some((s) => /SCC|Supreme/.test(`${s.act} ${s.section}`)));
     });
 
     it("deduplicates results when the same provision appears in both vector and FTS hits", async () => {

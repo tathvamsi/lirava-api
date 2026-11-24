@@ -4,7 +4,7 @@ import { retrieveLegalContext } from "../services/legal/rag.js";
 import { seedLegalCorpus } from "../services/legal/corpus-seeder.js";
 import { generateCourtPdf, generateCourtDocx, type LegalPleadingData } from "../services/legal/court-engine.js";
 import { config } from "../config.js";
-import { OFFLINE_NOTICE } from "../services/legal/notice.js";
+import { MODEL_UNAVAILABLE_MESSAGE } from "../services/legal/notice.js";
 import { requireAuth, type AuthEnv } from "../middleware/auth.js";
 import { rateLimit, requireAdmin } from "../middleware/security.js";
 
@@ -73,8 +73,8 @@ legalRoutes.post("/answer", async (c) => {
       // An empty reply (the model used its whole budget thinking) is a failure, not an answer.
       if (!answer) throw new Error("The model returned no answer text.");
     } catch {
-      const { generateLegalResponse } = await import("../services/legal/knowledge.js");
-      answer = OFFLINE_NOTICE + generateLegalResponse(question);
+      // No canned text stands in for the model: say it is unavailable and let the caller try again.
+      return c.json({ error: MODEL_UNAVAILABLE_MESSAGE, status: "model_unavailable" }, 503);
     }
 
     const citations = (ragResult?.sources || []).map((s) => ({

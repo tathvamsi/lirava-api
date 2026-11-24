@@ -4,6 +4,8 @@
  * user can change the wording. The choice is made from the request itself with plain rules, because the small
  * model that writes the answer cannot be trusted to choose. A question, an explanation or a chat reply is neither.
  */
+import { withEnglishHints } from "../legal/indic-terms.js";
+
 export type OutputMode = "document" | "plan";
 
 /** Things a lawyer files, sends or signs. */
@@ -19,7 +21,8 @@ const ASKS_FOR_WORK = /\b(draft|prepare|write|create|make|give me|build|put toge
 const QUESTION_START = /^\s*(what|why|how|when|who|which|is|are|can|does|do|should|explain|tell me|define)\b/i;
 
 export function classifyOutput(request: string): OutputMode | null {
-  const text = request.trim();
+  // A request in Kannada, Hindi, Marathi, Tamil or Telugu is read with the English terms for its legal words added (indic-terms.ts).
+  const text = withEnglishHints(request.trim());
   if (text.length < 8 || text.length > 1500) return null;
   if (!ASKS_FOR_WORK.test(text)) return null;
   // "What is a legal notice?" or "Explain the bail strategy" asks for knowledge, not for a piece of work.
@@ -43,7 +46,7 @@ export function modeDirective(mode: OutputMode): string {
   if (mode === "plan") {
     return `OUTPUT MODE: PLAN. The user asked for a plan or strategy. It will open in a separate plan panel, so write only the plan, with no greeting and no closing remarks. Start with a single "# " title line, then these "## " sections in order: Objective (one or two sentences), Key facts and issues (short bullets), Strategy (numbered steps; say who does each and by when where known), Risks and how to handle them, Next actions (a checklist, each line written as "- [ ] action"). Keep every bullet to one or two lines.`;
   }
-  return `OUTPUT MODE: DOCUMENT. The user asked for a legal document. It will open in a document editor, so write only the document itself, from its own heading to its signature block, with no greeting, no explanation before it and no notes after it. Begin with a "# " title line (for example "# Legal Notice for Recovery of Money"), then the document in full.`;
+  return `OUTPUT MODE: DOCUMENT. The user asked for a legal document. It will open in a document editor, so write only the document itself, from its own heading to its signature block, with no greeting, no explanation before it and no notes after it. Begin with a "# " title line that names the paper, never the court heading (for example "# Application for Regular Bail" or "# Legal Notice for Recovery of Money"), then the document in full, laid out the way it is filed in an Indian court: the court heading ("IN THE COURT OF ..."), the case number line, the parties ("BETWEEN ... AND ..."), the title of the application with its section, "MOST RESPECTFULLY SHEWETH:", then numbered paragraphs ("1.", "2.", ...), then "PRAYER", then place, date and the advocate's signature block. Put every heading, every numbered paragraph and every prayer on its own line with a blank line between them. Never run several paragraphs together on one line. Use [PLACEHOLDERS] for facts you were not given and never invent a fact, an Act or a section.`;
 }
 
 const PREAMBLE = /^(?:I('ll| will| have| am pleased to)|Here is|Here's|Certainly|Sure|Below is|As requested|Please find|Attached is|Understood)/i;

@@ -2,7 +2,52 @@ process.env.NODE_ENV = "test";
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { DOCUMENT_LANGUAGES, isDocumentLanguage, languageSection } from "../src/services/agent/language.js";
+import { DOCUMENT_LANGUAGES, isDocumentLanguage, languageAnswer, languageAnsweredTask, languageSection } from "../src/services/agent/language.js";
+
+describe("answering the language question", () => {
+  const ask = "Which language should I write this in? English (English), Hindi (हिन्दी), Kannada (ಕನ್ನಡ).";
+  const history = [
+    { role: "user", content: "Draft a bail application for my client in the murder case." },
+    { role: "assistant", content: ask },
+  ];
+
+  it("reads a short reply naming a language as 'go ahead' for the request it answers", () => {
+    const a = languageAnswer("Kannada please", history);
+    assert.equal(a?.language, "kn");
+    assert.equal(a?.original, "Draft a bail application for my client in the murder case.");
+    const task = languageAnsweredTask(a!);
+    assert.match(task, /bail application/);
+    assert.match(task, /Write it in Kannada/);
+    assert.match(task, /do not ask me anything else first/);
+  });
+
+  it("understands the native name and Hindi", () => {
+    assert.equal(languageAnswer("ಕನ್ನಡ", history)?.language, "kn");
+    assert.equal(languageAnswer("हिंदी में", history)?.language, "hi");
+    assert.equal(languageAnswer("English", history)?.language, "en");
+  });
+
+  it("does nothing when the assistant did not just ask, or the reply is a new request", () => {
+    assert.equal(languageAnswer("Kannada", [{ role: "user", content: "hi" }, { role: "assistant", content: "Hello, how can I help?" }]), null);
+    assert.equal(languageAnswer("Draft a reply notice in Kannada for a cheque case where the drawer denies the debt and the signature entirely.", history), null);
+    assert.equal(languageAnswer("thanks", history), null);
+    assert.equal(languageAnswer("Kannada", []), null);
+  });
+
+  it("a plain question is never told to ask which language, so a small model cannot ask it", () => {
+    const text = languageSection(undefined, { documentRequest: false });
+    assert.doesNotMatch(text, /Which language should I write this in/);
+    assert.match(text, /not a request for a document/);
+    assert.match(text, /Section 103 BNS/, "citations stay checkable");
+    // A document request, or no information, keeps the rule.
+    assert.match(languageSection(undefined, { documentRequest: true }), /Which language should I write this in/);
+    assert.match(languageSection(undefined), /Which language should I write this in/);
+  });
+
+  it("the no-saved-language rule tells the assistant to write at once after the answer", () => {
+    assert.match(languageSection(undefined), /never ask the question again/);
+  });
+});
 import { validatePreference } from "../src/services/preferences/index.js";
 
 describe("document language", () => {

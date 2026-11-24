@@ -104,7 +104,6 @@ export async function embedText(text: string, kind: EmbeddingKind = "query"): Pr
       body: JSON.stringify({
         model: config.customEmbeddingModel,
         input: normalized,
-        ...(config.ownLlm ? {} : { input_type: kind, truncate: "END", dimensions: dim }),
       }),
       signal: AbortSignal.timeout(config.upstreamTimeoutMs),
     });
@@ -157,7 +156,6 @@ export async function embedMany(texts: string[], kind: EmbeddingKind = "passage"
         body: JSON.stringify({
           model: config.customEmbeddingModel,
           input: batch,
-          ...(config.ownLlm ? {} : { input_type: kind, truncate: "END", dimensions: dim }),
         }),
         signal: AbortSignal.timeout(Math.max(config.upstreamTimeoutMs, 30_000)),
       });

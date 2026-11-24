@@ -12,6 +12,8 @@ import { ensureEnglishTsv } from "../db/fts.js";
 import { withSchemaLock } from "../db/schema-lock.js";
 import { deleteFilesForUser } from "../files/index.js";
 import { ocrEnabled, ocrFile } from "./ocr.js";
+import { classifyDocument, contentFingerprint, isDocKind, type DocKind } from "./classify.js";
+import { markdownSections, markitdownConvert, wantsMarkitdown } from "./markitdown.js";
 
 export type IndexStatus = "ready" | "no_text" | "unsupported" | "failed";
 
@@ -21,6 +23,8 @@ export interface IndexResult {
   chunks: number;
   unit: "page" | "section";
   note?: string;
+  /** Which reader produced the text: the MarkItDown service, or the built-in reader. Absent for files it does not apply to. */
+  converter?: "markitdown" | "builtin";
 }
 
 export interface DocumentHit {
@@ -54,6 +58,10 @@ CREATE TABLE IF NOT EXISTS matter_documents (
   note            TEXT,
   created_at      BIGINT NOT NULL
 );
+ALTER TABLE matter_documents ADD COLUMN IF NOT EXISTS doc_kind TEXT;
+ALTER TABLE matter_documents ADD COLUMN IF NOT EXISTS doc_kind_by TEXT;
+ALTER TABLE matter_documents ADD COLUMN IF NOT EXISTS content_hash TEXT;
+ALTER TABLE matter_documents ADD COLUMN IF NOT EXISTS converted_by TEXT;
 CREATE INDEX IF NOT EXISTS matter_documents_user_matter_idx ON matter_documents (user_id, matter_id);
 CREATE INDEX IF NOT EXISTS matter_documents_user_conv_idx ON matter_documents (user_id, conversation_id);
 
@@ -194,7 +202,7 @@ export async function extractPages(
   mime: string,
   buffer: Buffer,
   options: { ocr?: boolean } = {},
-): Promise<{ pages: string[]; unit: "page" | "section"; ocr?: OcrSummary } | { unsupported: true }> {
+): Promise<{ pages: string[]; unit: "page" | "section"; ocr?: OcrSummary; converter?: "markitdown" | "builtin" } | { unsupported: true }> {
   const lower = name.toLowerCase();
   if (mime.includes("pdf") || lower.endsWith(".pdf")) {
     const result = await extractText(new Uint8Array(buffer), { mergePages: false });
@@ -214,8 +222,19 @@ export async function extractPages(
     const read = await readWithOcr(buffer, [0]);
     return { pages: [read?.texts.get(0) ?? ""], unit: "page", ...(read ? { ocr: read.summary } : {}) };
   }
+  // Word, PowerPoint, Excel, HTML and the like are converted to Markdown by the conversion service, which keeps headings
+  // and tables. If it is off or down, the built-in readers below take over (Word and plain text) or the file is unsupported.
+  if (wantsMarkitdown(name)) {
+    try {
+      const { markdown } = await markitdownConvert(name, buffer);
+      const pages = markdownSections(markdown, 1400, 600).slice(0, MAX_PAGES);
+      if (pages.length) return { pages, unit: "section", converter: "markitdown" };
+    } catch (err) {
+      console.warn("[documents] conversion service failed, using the built-in reader:", (err as Error).message);
+    }
+  }
   if (lower.endsWith(".docx")) {
-    return { pages: toSections(await docxParagraphs(buffer)).slice(0, MAX_PAGES), unit: "section" };
+    return { pages: toSections(await docxParagraphs(buffer)).slice(0, MAX_PAGES), unit: "section", converter: "builtin" };
   }
   if (/\.(txt|md|csv|rtf)$/.test(lower) || mime.startsWith("text/")) {
     const lines = buffer.toString("utf8").replace(/\r\n?/g, "\n").split("\n").map((l) => l.trim()).filter(Boolean);
@@ -269,6 +288,9 @@ export async function indexDocument(input: {
   const sql = await pg();
   const now = Date.now();
   let result: IndexResult;
+  let docKind: string | null = null;
+  let contentHash: string | null = null;
+  let converter: string | null = null;
   const rows: Array<{ document_id: string; user_id: string; page: number; idx: number; text: string }> = [];
 
   try {
@@ -276,8 +298,13 @@ export async function indexDocument(input: {
     if ("unsupported" in extracted) {
       result = { status: "unsupported", pages: 0, chunks: 0, unit: "page", note: "This file type is stored but its text is not searchable." };
     } else {
+      docKind = classifyDocument(input.name, extracted.pages.join("\n")).kind;
+      contentHash = contentFingerprint(extracted.pages);
+      converter = extracted.converter ?? null;
       extracted.pages.forEach((pageText, pageIndex) => {
-        chunkText(pageText).forEach((text, idx) => {
+        // Converted Markdown keeps its line breaks, headings and tables: each section is one chunk. Other text is chunked as before.
+        const pieces = extracted.converter === "markitdown" ? [pageText.trim()].filter(Boolean) : chunkText(pageText);
+        pieces.forEach((text, idx) => {
           if (rows.length < MAX_CHUNKS) rows.push({ document_id: input.fileId, user_id: input.userId, page: pageIndex + 1, idx, text });
         });
       });
@@ -290,7 +317,14 @@ export async function indexDocument(input: {
               unit: extracted.unit,
               note: "No readable text was found. A scanned document needs OCR before it can be searched.",
             }
-          : { status: "ready", pages: extracted.pages.length, chunks: rows.length, unit: extracted.unit, ...(extracted.ocr ? { note: ocrNote(extracted.ocr) } : {}) };
+          : {
+              status: "ready",
+              pages: extracted.pages.length,
+              chunks: rows.length,
+              unit: extracted.unit,
+              ...(extracted.ocr ? { note: ocrNote(extracted.ocr) } : {}),
+              ...(extracted.converter ? { converter: extracted.converter } : {}),
+            };
     }
   } catch (err) {
     console.warn("[documents] could not read", input.name, (err as Error).message);
@@ -299,9 +333,10 @@ export async function indexDocument(input: {
 
   await sql.begin(async (tx) => {
     await tx`
-      INSERT INTO matter_documents (id, user_id, name, mime, conversation_id, matter_id, unit, pages, chunks, status, note, created_at)
+      INSERT INTO matter_documents (id, user_id, name, mime, conversation_id, matter_id, unit, pages, chunks, status, note, created_at, doc_kind, doc_kind_by, content_hash, converted_by)
       VALUES (${input.fileId}, ${input.userId}, ${input.name}, ${input.mime}, ${input.conversationId ?? null}, ${input.matterId ?? null},
-              ${result.unit}, ${result.pages}, ${result.chunks}, ${result.status}, ${result.note ?? null}, ${now})
+              ${result.unit}, ${result.pages}, ${result.chunks}, ${result.status}, ${result.note ?? null}, ${now},
+              ${docKind}, ${docKind ? "auto" : null}, ${contentHash}, ${converter})
       ON CONFLICT (id) DO NOTHING`;
     for (let i = 0; i < rows.length; i += 200) {
       await tx`INSERT INTO document_chunks ${tx(rows.slice(i, i + 200), "document_id", "user_id", "page", "idx", "text")}`;
@@ -417,24 +452,45 @@ export interface DocumentSummary {
   conversationId: string | null;
   matterId: string | null;
   createdAt: number;
+  /** What the document is (FIR, charge sheet, ...); "other" when it could not be told. Null for files read before types existed. */
+  kind: DocKind | null;
+  /** "auto" when guessed from the text, "user" when the lawyer set it. */
+  kindBy: "auto" | "user" | null;
+  /** Set when an earlier upload to the same matter has the same text: the id of that earlier copy. */
+  duplicateOf?: string;
 }
 
+const kindOf = (value: unknown): DocKind | null => (isDocKind(value) ? value : null);
+
+/** Newest first. Of several uploads with the same text, the earliest is the original and the rest point to it. */
 export async function listMatterDocuments(userId: string, matterId: string): Promise<DocumentSummary[]> {
   const sql = await pg();
   const rows = await sql`
-    SELECT id, name, status, pages, unit, note, conversation_id, matter_id, created_at
+    SELECT id, name, status, pages, unit, note, conversation_id, matter_id, created_at, doc_kind, doc_kind_by, content_hash
     FROM matter_documents WHERE user_id = ${userId} AND matter_id = ${matterId} ORDER BY created_at DESC`;
-  return rows.map((r) => ({
-    id: r.id as string,
-    name: r.name as string,
-    status: r.status as IndexStatus,
-    pages: Number(r.pages),
-    unit: r.unit as "page" | "section",
-    note: (r.note as string | null) ?? null,
-    conversationId: (r.conversation_id as string | null) ?? null,
-    matterId: (r.matter_id as string | null) ?? null,
-    createdAt: Number(r.created_at),
-  }));
+  const original = new Map<string, { id: string; at: number }>();
+  for (const r of rows) {
+    const hash = r.content_hash as string | null;
+    if (!hash) continue;
+    const at = Number(r.created_at);
+    const seen = original.get(hash);
+    if (!seen || at < seen.at) original.set(hash, { id: r.id as string, at });
+  }
+  return rows.map((r) => {
+    const hash = r.content_hash as string | null;
+    const first = hash ? original.get(hash) : undefined;
+    return {
+      ...toSummary(r),
+      ...(first && first.id !== r.id ? { duplicateOf: first.id } : {}),
+    };
+  });
+}
+
+/** Lets the lawyer correct a wrong guess. Returns false if the document is not theirs. */
+export async function setDocumentKind(userId: string, documentId: string, kind: DocKind): Promise<boolean> {
+  const sql = await pg();
+  const rows = await sql`UPDATE matter_documents SET doc_kind = ${kind}, doc_kind_by = 'user' WHERE id = ${documentId} AND user_id = ${userId} RETURNING id`;
+  return rows.length > 0;
 }
 
 const toSummary = (r: Record<string, unknown>): DocumentSummary => ({
@@ -447,6 +503,8 @@ const toSummary = (r: Record<string, unknown>): DocumentSummary => ({
   conversationId: (r.conversation_id as string | null) ?? null,
   matterId: (r.matter_id as string | null) ?? null,
   createdAt: Number(r.created_at),
+  kind: kindOf(r.doc_kind),
+  kindBy: r.doc_kind_by === "auto" || r.doc_kind_by === "user" ? r.doc_kind_by : null,
 });
 
 /** The user's documents with these ids, newest first. Ids that are not theirs are simply absent. */
@@ -454,7 +512,7 @@ export async function describeDocuments(userId: string, ids: string[]): Promise<
   if (!userId || !ids.length) return [];
   const sql = await pg();
   const rows = await sql`
-    SELECT id, name, status, pages, unit, note, conversation_id, matter_id, created_at
+    SELECT id, name, status, pages, unit, note, conversation_id, matter_id, created_at, doc_kind, doc_kind_by
     FROM matter_documents WHERE user_id = ${userId} AND id = ANY(${ids}) ORDER BY created_at DESC`;
   return rows.map(toSummary);
 }

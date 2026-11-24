@@ -12,8 +12,6 @@ const list = (value: string | undefined) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
-const ownLlm = process.env.OWN_LLM === "true";
-
 export const config = {
   port: Number(process.env.PORT || 4000),
   // Listen on all interfaces only when told to (containers). Otherwise stay on loopback.
@@ -30,31 +28,28 @@ export const config = {
 
   databaseUrl: process.env.DATABASE_URL || "",
 
-  // Inference & LLM (OpenAI-compatible server)
-  // OWN_LLM=true uses your own server (CUSTOM_LLM_*); anything else uses NVIDIA NIM (NIM_*, NVIDIA_API_KEY).
-  // The rest of the app reads these three values and does not need to know which provider is active.
-  ownLlm,
-  customLlmBaseUrl: ownLlm
-    ? process.env.CUSTOM_LLM_BASE_URL || "http://localhost:1618/v1"
-    : (process.env.NIM_BASE_URL || "https://integrate.api.nvidia.com/v1").replace(/\/$/, ""),
-  customLlmApiKey: ownLlm ? process.env.CUSTOM_LLM_API_KEY || "not-needed" : process.env.NVIDIA_API_KEY || "",
-  customLlmModel: ownLlm
-    ? process.env.CUSTOM_LLM_MODEL || "default"
-    : process.env.NIM_LLM_MODEL || "nvidia/nemotron-3.5-super-vl-120b-a12b",
+  // Inference & LLM (OpenAI-compatible servers). A chat can use three providers (Lirava's own server, NVIDIA, Sarvam), chosen
+  // per message; their settings are in services/agent/providers.ts. These three values are Lirava's own server (CUSTOM_LLM_*),
+  // which is also where embeddings and the case-file builds run.
+  /** The provider a chat uses when none is picked: custom (our own server), nvidia or sarvam. */
+  defaultLlmProvider: process.env.DEFAULT_LLM_PROVIDER || "custom",
+  customLlmBaseUrl: process.env.CUSTOM_LLM_BASE_URL || "http://localhost:1618/v1",
+  customLlmApiKey: process.env.CUSTOM_LLM_API_KEY || "not-needed",
+  customLlmModel: process.env.CUSTOM_LLM_MODEL || "default",
 
   /**
    * How many tokens one request may use in total (prompt + answer). On your own server this is the size of ONE slot:
    * the server's context (-c / ctxSize) divided by its parallel slots (32768 / 4 = 8192). Chats are trimmed and
    * summarised to fit it, and the answer is never allowed to run past it.
    */
-  contextWindowTokens: Number(process.env.CONTEXT_WINDOW_TOKENS || (ownLlm ? 8192 : 32768)),
+  contextWindowTokens: Number(process.env.CONTEXT_WINDOW_TOKENS || 8192),
   /** Most tokens one answer may use before it is continued in a second call. */
-  answerMaxTokens: Number(process.env.ANSWER_MAX_TOKENS || (ownLlm ? 1500 : 1800)),
+  answerMaxTokens: Number(process.env.ANSWER_MAX_TOKENS || 1500),
   /**
    * True when the model can look at images (the Lirava VL model on our own server). Attached PNG/JPEG/GIF files are
-   * then sent to it with the question. Set LLM_VISION=true or false to override; the default follows OWN_LLM.
+   * then sent to it with the question. Set LLM_VISION=false if your own server runs a model that cannot read images.
    */
-  visionEnabled: process.env.LLM_VISION ? process.env.LLM_VISION === "true" : ownLlm,
+  visionEnabled: process.env.LLM_VISION ? process.env.LLM_VISION === "true" : true,
   /** Window tokens held back for each image (a full-screen screenshot is about 1,100). */
   imageTokens: Number(process.env.IMAGE_TOKENS || 1500),
 
@@ -66,15 +61,21 @@ export const config = {
   ocrApiKey: process.env.OCR_API_KEY || "",
   ocrLang: process.env.OCR_LANG || "auto",
 
+  /**
+   * Document conversion service (Microsoft MarkItDown, on our own server). It turns Word, PowerPoint, Excel, HTML and
+   * similar files into Markdown, keeping headings and tables. Leave MARKITDOWN_BASE_URL empty to turn it off: those files are
+   * then read by the built-in readers (Word) or reported as unsupported (the rest), as before.
+   */
+  markitdownBaseUrl: (process.env.MARKITDOWN_BASE_URL || "").replace(/\/$/, ""),
+  markitdownApiKey: process.env.MARKITDOWN_API_KEY || "",
+
   // Qdrant Vector Engine
   qdrantUrl: process.env.QDRANT_URL || "",
   qdrantApiKey: process.env.QDRANT_API_KEY || "",
   qdrantCollection: process.env.QDRANT_COLLECTION || "soli_legal_corpus",
 
   // RAG Configuration
-  customEmbeddingModel: ownLlm
-    ? process.env.CUSTOM_EMBEDDING_MODEL || "default"
-    : process.env.NIM_EMBEDDING_MODEL || "nvidia/nemotron-3.5-embed-1b",
+  customEmbeddingModel: process.env.CUSTOM_EMBEDDING_MODEL || "default",
   embeddingDimensions: Number(process.env.EMBEDDING_DIMENSIONS || 1024),
   chunkSize: Number(process.env.CHUNK_SIZE || 1200),
   chunkOverlap: Number(process.env.CHUNK_OVERLAP || 200),

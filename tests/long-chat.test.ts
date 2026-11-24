@@ -67,7 +67,7 @@ describe("answers are not cut off", () => {
 
     const text = await ask(app, user, conv, "CUTOFF_FOREVER explain everything");
     assert.ok(text.endsWith(CUT_OFF_NOTICE.trim()), `ends with the notice: ...${text.slice(-120)}`);
-    assert.equal(mock.requests.length, 3, "the first call plus two continuations, then it stops asking");
+    assert.equal(mock.requests.length, 3, "the first call plus two continuations (the limit for a question), then it stops asking");
     for (const r of mock.requests) assert.ok((r.maxTokens ?? 0) > 0 && (r.maxTokens ?? 0) <= config.answerMaxTokens, `max_tokens ${r.maxTokens} stays within the answer allowance`);
 
     // The saved message is the same text the user saw.

@@ -6,8 +6,8 @@
  * saved with the chat and put back in front of the model on every later message. This runs after an answer has
  * been sent, so the user never waits for it, and if it fails the chat simply carries on without it.
  */
-import { config } from "../../config.js";
-import { OFFLINE_NOTICE } from "../legal/notice.js";
+import { llmModel } from "./providers.js";
+import { MODEL_UNAVAILABLE_MESSAGE, OFFLINE_NOTICE } from "../legal/notice.js";
 import { getChatSummary, historyAfter, setChatSummary } from "../chats/store.js";
 import { getLlmClient } from "./client.js";
 import { estimateTokens, shrinkText, type ChatTurn } from "./context-budget.js";
@@ -33,7 +33,7 @@ export function toTurn(m: { role: string; text: string }): ChatTurn | null {
   const text = m.text.replace(/^> ⚖️[\s\S]*?---\n\n/, "").trim();
   if (!text) return null;
   // Stored offline fallbacks and raw clause dumps would teach the model to repeat them.
-  if (m.role === "vakil" && (m.text.startsWith(OFFLINE_NOTICE) || m.text.includes('(a) "information"') || m.text.includes("Legal Consultation Brief"))) return null;
+  if (m.role === "vakil" && (m.text.startsWith(OFFLINE_NOTICE) || m.text === MODEL_UNAVAILABLE_MESSAGE || m.text.includes('(a) "information"') || m.text.includes("Legal Consultation Brief"))) return null;
   return {
     role: m.role === "vakil" || m.role === "assistant" ? "assistant" : m.role === "user" ? "user" : "system",
     content: text.length > HISTORY_MESSAGE_CHARS ? `${text.slice(0, HISTORY_MESSAGE_CHARS)}...` : text,
@@ -74,7 +74,7 @@ export async function maybeSummarizeChat(conversationId: string, userId: string)
     const openai = getLlmClient();
     const res = await openai.chat.completions.create(
       {
-        model: config.customLlmModel,
+        model: llmModel(),
         messages: [
           { role: "system", content: SUMMARY_SYSTEM_PROMPT },
           { role: "user", content: `CURRENT SUMMARY:\n${summary || "(none yet)"}\n\nNEW MESSAGES TO ADD:\n${transcript}\n\nWrite the updated summary.` },

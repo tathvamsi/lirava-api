@@ -1,0 +1,3 @@
+# Microsoft MarkItDown with only the converters Lirava uses (Word, PowerPoint, Excel). PDFs are read elsewhere and
+# images are read by the OCR service, so the pdf and image extras are left out on purpose.
+markitdown[docx,pptx,xlsx,xls]>=0.1.2,<0.2

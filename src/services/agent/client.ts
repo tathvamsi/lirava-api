@@ -1,19 +1,26 @@
 import { OpenAI } from "openai";
 import { config } from "../../config.js";
+import { activeProvider } from "./providers.js";
 
-let clientInstance: OpenAI | null = null;
+// One client per provider (and per address and key, which the tests and admin tools can change while the process runs).
+const clients = new Map<string, OpenAI>();
 
+/** The client for the provider the current request chose, or for the server's default provider. */
 export function getLlmClient(): OpenAI {
-  if (clientInstance) return clientInstance;
-
-  clientInstance = new OpenAI({
-    baseURL: config.customLlmBaseUrl,
-    apiKey: config.customLlmApiKey,
-    timeout: 120000,
-    maxRetries: 0,
-  });
-
-  return clientInstance;
+  const p = activeProvider();
+  const cacheKey = `${p.id}|${p.baseURL}|${p.apiKey}`;
+  let client = clients.get(cacheKey);
+  if (!client) {
+    client = new OpenAI({
+      baseURL: p.baseURL,
+      apiKey: p.apiKey || "not-needed",
+      defaultHeaders: p.headers,
+      timeout: 120000,
+      maxRetries: 0,
+    });
+    clients.set(cacheKey, client);
+  }
+  return client;
 }
 
 export async function checkLlmHealth(): Promise<{

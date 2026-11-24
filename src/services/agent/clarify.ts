@@ -7,7 +7,7 @@
  * message, so no database change is needed.
  */
 import { getLlmClient } from "./client.js";
-import { config } from "../../config.js";
+import { llmModel } from "./providers.js";
 import type { ChatTurn } from "./context-budget.js";
 
 /** Marker the user's reply starts with when it answers a card (the app writes it, see the front end's clarify.ts). */
@@ -45,7 +45,11 @@ Never ask the user to share, upload, send or paste a document, file, report or t
 Write questions in plain words a client would understand: ask about the facts and what the user wants, never which statute or section applies. Do not ask for exact names, addresses or amounts: the draft will carry placeholders for those.`;
 
 /** Requests that ask the assistant to produce or plan something are the ones that can lack facts. */
-const TASKY = /\b(draft|prepare|write|file|filing|help|review|advise|advice|need|want|make|create|reply|respond|notice|petition|application|agreement|contract|plan|strategy|represent|handle|take on|sue|complain)/i;
+// Only asking verbs count: a question that merely mentions a notice, a complaint or a contract ("what is the notice period?",
+// "limitation for a Section 138 complaint?") needs no questions back, and the check costs a model call and several seconds.
+const TASKY = /\b(draft|prepare|write|compose|frame|file|filing|help me|need (?:a|an|to|help)|want (?:a|an|to)|make (?:a|an)|create|advise me|represent|handle my|take on my|sue|reply to|respond to|plan|strategy)\b/i;
+/** A question about the law, not a request for work. */
+const ASKS_A_QUESTION = /^\s*(?:what|why|how|when|who|which|is|are|does|do|explain|tell me|define|difference)\b/i;
 
 const clip = (value: unknown, max: number) => (typeof value === "string" ? value.trim().slice(0, max) : "");
 
@@ -94,6 +98,7 @@ export async function decideClarify(input: {
   const { userText, history, hasAttachments, matterBrief, signal } = input;
   if (hasAttachments || isAnswersMessage(userText)) return null;
   if (userText.length > 600 || !TASKY.test(userText)) return null;
+  if (ASKS_A_QUESTION.test(userText) && !/\b(draft|prepare|write|compose|create)\b/i.test(userText)) return null;
   // Never two rounds in a row: after a card, a free-text reply is taken as the answer.
   const lastAssistant = [...history].reverse().find((t) => t.role === "assistant");
   if (lastAssistant && hasAskBlock(lastAssistant.content)) return null;
@@ -107,7 +112,7 @@ export async function decideClarify(input: {
   try {
     const response = await getLlmClient().chat.completions.create(
       {
-        model: config.customLlmModel,
+        model: llmModel(),
         messages: [
           { role: "system", content: DECIDE_PROMPT },
           { role: "user", content: `${context ? `${context}\n\n` : ""}The user's new message:\n${userText}` },
