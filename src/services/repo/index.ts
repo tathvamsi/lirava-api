@@ -186,6 +186,39 @@ export async function createMatter(input: { userId: string; title: string; clien
   return matter;
 }
 
+export const MATTER_STATUSES = ["active", "on_hold", "closed", "archived"] as const;
+
+/** Moves a matter between active, on hold, closed and archived. Someone else's matter is not found. */
+export async function setMatterStatus(id: string, userId: string, status: (typeof MATTER_STATUSES)[number]): Promise<Matter | null> {
+  const sql = await pgData();
+  const rows = await sql`UPDATE app_matters SET status = ${status}, updated_at = ${Date.now()} WHERE id = ${id} AND user_id = ${userId} RETURNING *`;
+  return rows[0] ? toMatter(rows[0]) : null;
+}
+
+/**
+ * Deletes a matter with its timeline, case file and papers. Chats, notes and automations that pointed at it are kept and
+ * simply detached, so no conversation is lost.
+ */
+export async function deleteMatter(id: string, userId: string): Promise<boolean> {
+  const sql = await pgData();
+  const owned = await sql`SELECT 1 FROM app_matters WHERE id = ${id} AND user_id = ${userId} LIMIT 1`;
+  if (!owned.length) return false;
+  const { deleteDocumentsByIds, listMatterDocuments } = await import("../documents/index.js");
+  const docs = await listMatterDocuments(userId, id).catch(() => []);
+  if (docs.length) await deleteDocumentsByIds(userId, docs.map((d) => d.id)).catch(() => undefined);
+  const detach = async (run: () => Promise<unknown>) => {
+    try { await run(); } catch { /* the table does not exist when its feature was never used */ }
+  };
+  await detach(() => sql`UPDATE chat_conversations SET matter_id = NULL WHERE matter_id = ${id} AND user_id = ${userId}`);
+  await detach(() => sql`UPDATE user_notes SET matter_id = NULL WHERE matter_id = ${id} AND user_id = ${userId}`);
+  await detach(() => sql`UPDATE automations SET matter_id = NULL WHERE matter_id = ${id} AND user_id = ${userId}`);
+  await detach(async () => (await import("../casebrain/index.js")).deleteMatterNodes(userId, id));
+  await detach(() => sql`DELETE FROM matter_case_files WHERE matter_id = ${id} AND user_id = ${userId}`);
+  await sql`DELETE FROM app_matter_events WHERE matter_id = ${id} AND user_id = ${userId}`;
+  await sql`DELETE FROM app_matters WHERE id = ${id} AND user_id = ${userId}`;
+  return true;
+}
+
 // ---------------- MATTER TIMELINE ----------------
 const toEvent = (r: Row): MatterEvent => ({
   id: r.id,

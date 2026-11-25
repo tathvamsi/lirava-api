@@ -1,6 +1,9 @@
 import { Hono } from "hono";
 import {
   createMatter,
+  deleteMatter,
+  MATTER_STATUSES,
+  setMatterStatus,
   getMatterForUser,
   listMatterEvents,
   listMatters,
@@ -8,6 +11,7 @@ import {
   type MatterIntake,
 } from "../services/repo/index.js";
 import { advanceCaseFile, getCaseFile } from "../services/casefile/index.js";
+import { createNode, deleteNode, ensureSections, importCaseFile, listNodes, updateNode, type NodeInput } from "../services/casebrain/index.js";
 import { requireAuth, type AuthEnv } from "../middleware/auth.js";
 
 export const mattersRoutes = new Hono<AuthEnv>();
@@ -91,6 +95,71 @@ mattersRoutes.post("/:id/case-file/build", async (c) => {
   } catch {
     return c.json({ error: "The case file could not be built. Try again." }, 502);
   }
+});
+
+// ---------------- The case knowledge tree ----------------
+
+/** The tree for this matter (its starting sections are created on first use). */
+mattersRoutes.get("/:id/nodes", async (c) => {
+  const userId = c.get("user").id;
+  const matter = await getMatterForUser(c.req.param("id"), userId);
+  if (!matter) return c.json({ error: "Matter not found." }, 404);
+  await ensureSections(userId, matter.id);
+  return c.json({ nodes: await listNodes(userId, matter.id) });
+});
+
+mattersRoutes.post("/:id/nodes", async (c) => {
+  const userId = c.get("user").id;
+  const matter = await getMatterForUser(c.req.param("id"), userId);
+  if (!matter) return c.json({ error: "Matter not found." }, 404);
+  const body = (await c.req.json().catch(() => null)) as NodeInput | null;
+  const node = body ? await createNode(userId, matter.id, body) : null;
+  if (!node) return c.json({ error: "A node needs a kind and a title, and its parent must be in this matter." }, 400);
+  return c.json({ node }, 201);
+});
+
+/** Pulls what the papers say (parties, dates, facts, claims) into the tree as proposed nodes the lawyer can confirm. */
+mattersRoutes.post("/:id/nodes/import", async (c) => {
+  const userId = c.get("user").id;
+  const matter = await getMatterForUser(c.req.param("id"), userId);
+  if (!matter) return c.json({ error: "Matter not found." }, 404);
+  const { added } = await importCaseFile(userId, matter.id);
+  return c.json({ added, nodes: await listNodes(userId, matter.id) });
+});
+
+mattersRoutes.patch("/:id/nodes/:nodeId", async (c) => {
+  const userId = c.get("user").id;
+  const matter = await getMatterForUser(c.req.param("id"), userId);
+  if (!matter) return c.json({ error: "Matter not found." }, 404);
+  const body = (await c.req.json().catch(() => null)) as NodeInput | null;
+  const node = body ? await updateNode(userId, matter.id, c.req.param("nodeId"), body) : null;
+  if (!node) return c.json({ error: "That node was not found, or the change is not allowed." }, 404);
+  return c.json({ node });
+});
+
+mattersRoutes.delete("/:id/nodes/:nodeId", async (c) => {
+  const userId = c.get("user").id;
+  const matter = await getMatterForUser(c.req.param("id"), userId);
+  if (!matter) return c.json({ error: "Matter not found." }, 404);
+  if (!(await deleteNode(userId, matter.id, c.req.param("nodeId")))) return c.json({ error: "Node not found." }, 404);
+  return c.json({ ok: true, nodes: await listNodes(userId, matter.id) });
+});
+
+/** Changes a matter's status: active, on_hold, closed or archived (archiving puts a matter away and can be undone). */
+mattersRoutes.patch("/:id", async (c) => {
+  const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+  const status = MATTER_STATUSES.find((s) => s === body?.status);
+  if (!status) return c.json({ error: "Status must be active, on_hold, closed or archived." }, 400);
+  const matter = await setMatterStatus(c.req.param("id"), c.get("user").id, status);
+  if (!matter) return c.json({ error: "Matter not found." }, 404);
+  return c.json({ matter });
+});
+
+/** Deletes a matter for good, with its timeline, case file and papers. Its chats are kept, detached from it. */
+mattersRoutes.delete("/:id", async (c) => {
+  const ok = await deleteMatter(c.req.param("id"), c.get("user").id);
+  if (!ok) return c.json({ error: "Matter not found." }, 404);
+  return c.json({ ok: true });
 });
 
 mattersRoutes.post("/:id/checkpoints/:eventId", async (c) => {
