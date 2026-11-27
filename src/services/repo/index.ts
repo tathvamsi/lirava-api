@@ -3,6 +3,7 @@ import { emit } from "../bus/index.js";
 import { getConversation, listConversations, listRecentMessages } from "../chats/store.js";
 import { pgData } from "../data/pg.js";
 import { getPreferences } from "../preferences/index.js";
+import { initializeMatterKnowledgeTree } from "../casebrain/index.js";
 
 export type { Conversation, Message } from "../chats/store.js";
 
@@ -181,6 +182,12 @@ export async function createMatter(input: { userId: string; title: string; clien
     RETURNING *`;
   const matter = toMatter(rows[0]);
   if (input.intake) {
+    await initializeMatterKnowledgeTree(input.userId, id, {
+      title: matter.title,
+      client: matter.client,
+      court: matter.court,
+      intake: input.intake,
+    });
     await addMatterEvent({ matterId: id, userId: input.userId, type: "stage", stage: "received", title: "Case handed over", body: "Your counsel has your brief and is going through it." });
   }
   return matter;

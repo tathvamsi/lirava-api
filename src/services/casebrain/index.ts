@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import { getSql } from "../db/postgres.js";
 import { withSchemaLock } from "../db/schema-lock.js";
 import { getCaseFile } from "../casefile/index.js";
+import { buildOnboardingNodes, type OnboardingMatter } from "./onboarding.js";
 
 export const NODE_KINDS = ["section", "party", "fact", "event", "issue", "law", "argument", "evidence", "question", "note"] as const;
 export const NODE_STATUSES = ["proposed", "confirmed", "disputed"] as const;
@@ -131,6 +132,28 @@ export async function ensureSections(userId: string, matterId: string): Promise<
       INSERT INTO case_nodes (id, matter_id, user_id, parent_id, kind, title, status, origin, origin_key, position, created_at, updated_at)
       VALUES (${`node_${crypto.randomUUID()}`}, ${matterId}, ${userId}, NULL, 'section', ${title}, 'confirmed', 'lawyer', ${`section:${key}`}, ${i}, ${now}, ${now})
       ON CONFLICT (matter_id, origin_key) WHERE origin_key IS NOT NULL DO NOTHING`;
+  }
+}
+
+/**
+ * Seeds the tree with the facts a lawyer supplied during handover. These are
+ * confirmed from the outset because they are the lawyer's own instructions,
+ * unlike items extracted from uploaded papers, which remain proposed.
+ */
+export async function initializeMatterKnowledgeTree(userId: string, matterId: string, matter: OnboardingMatter): Promise<void> {
+  await ensureSections(userId, matterId);
+  const sections = new Map((await listNodes(userId, matterId)).filter((node) => node.kind === "section").map((node) => [node.title, node.id]));
+  for (const entry of buildOnboardingNodes(matter)) {
+    const parentId = sections.get(entry.section);
+    if (!parentId) continue;
+    await createNode(userId, matterId, {
+      parentId,
+      kind: entry.kind,
+      title: entry.title,
+      body: entry.body,
+      date: entry.date,
+      status: entry.status,
+    });
   }
 }
 

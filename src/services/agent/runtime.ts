@@ -44,6 +44,8 @@ import { detectLanguage, languageAnswer, languageAnsweredTask, languageSection }
 import { activeProvider, defaultProvider, llmModel, providerFor, publicProviders, withProvider, type Provider } from "./providers.js";
 import { intakeMessage, intakeReplyTo, intakeTask, isThinReply, matterFactsBrief, planIntake } from "./intake.js";
 import { getCaseFile } from "../casefile/index.js";
+import { listNodes } from "../casebrain/index.js";
+import { buildKnowledgeTreeContext } from "../casebrain/context.js";
 import { getPreferences } from "../preferences/index.js";
 import { CLARIFY_ANSWERED, decideClarify, hasAskBlock, isAnswersMessage, plainAsk, withAnsweredNote } from "./clarify.js";
 import { classifyOutput, modeDirective } from "./output-mode.js";
@@ -320,6 +322,7 @@ export async function sendMessage(
     // A bail petition has a fixed checklist (who it is for, which court, what the case is, arrest and custody) that is
     // checked against the matter and the case file, and only what is missing is asked (see intake.ts).
     const caseFile = matterId ? await withTimeout(getCaseFile(userId, matterId).then((v) => v?.content ?? null).catch(() => null), 3000, null) : null;
+    const knowledgeNodes = matterId ? await withTimeout(listNodes(userId, matterId).catch(() => []), 1500, []) : [];
     const savedLanguageEarly = await withTimeout(getPreferences(userId).then((p) => p.documentLanguage).catch(() => undefined), 1500, undefined);
     const intakeReply = intakeReplyTo(cleanHistory, userText);
     const intakePlan =
@@ -477,6 +480,11 @@ export async function sendMessage(
 
     if (documentContext.text) {
       sections.push({ id: "documents", text: documentContext.body ?? documentContext.text, tail: documentContext.rules, floorTokens: 300, shedOrder: 40 });
+    }
+
+    const knowledgeTreeContext = buildKnowledgeTreeContext(taskText, knowledgeNodes);
+    if (knowledgeTreeContext) {
+      sections.push({ id: "knowledge-tree", text: knowledgeTreeContext, floorTokens: 180, shedOrder: 45 });
     }
 
     // What the user asked Lirava to remember about them (settings → Memory). Shed early if the prompt is too long.
