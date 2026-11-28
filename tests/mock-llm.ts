@@ -58,7 +58,7 @@ export async function startMockLlm(): Promise<MockLlm> {
         const cutOff = allText.includes("CUTOFF") && (!isContinuation || allText.includes("CUTOFF_FOREVER"));
 
         const slow = user.includes("SLOW");
-        const words = isContinuation && !cutOff ? ["and", "the", "rest", "of", "the", "answer."] : cutOff ? Array.from({ length: 12 }, (_, i) => `part${i}`) : slow ? Array.from({ length: 40 }, (_, i) => `word${i}`) : ["Per", "the", "order", "[D1],", "bail", "was", "sought."];
+        const words = isContinuation && !cutOff ? ["and", "the", "rest", "of", "the", "answer."] : cutOff ? Array.from({ length: 12 }, (_, i) => `part${i}`) : slow ? Array.from({ length: 40 }, (_, i) => `word${i}`) : user.includes("TREECITE") ? ["The", "client", "is", "recorded", "in", "the", "case", "tree", "[T1]."] : ["Per", "the", "order", "[D1],", "bail", "was", "sought."];
         const delay = slow ? 150 : 15;
 
         if (!body.stream) {

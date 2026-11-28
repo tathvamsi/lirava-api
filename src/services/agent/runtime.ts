@@ -30,6 +30,7 @@ import {
 } from "./context-budget.js";
 import { maybeSummarizeChat, toTurn } from "./summary.js";
 import { classifySmallTalk, smallTalkReply } from "./smalltalk.js";
+import { answerFormatSection } from "./answer-format.js";
 import { decideRetrieval, hasLegalSignal } from "./retrieval-gate.js";
 import { config } from "../../config.js";
 import { MODEL_UNAVAILABLE_MESSAGE } from "../legal/notice.js";
@@ -45,7 +46,7 @@ import { activeProvider, defaultProvider, llmModel, providerFor, publicProviders
 import { intakeMessage, intakeReplyTo, intakeTask, isThinReply, matterFactsBrief, planIntake } from "./intake.js";
 import { getCaseFile } from "../casefile/index.js";
 import { listNodes } from "../casebrain/index.js";
-import { buildKnowledgeTreeContext } from "../casebrain/context.js";
+import { buildKnowledgeTreeSources, keepCitedTreeSources } from "../casebrain/context.js";
 import { getPreferences } from "../preferences/index.js";
 import { CLARIFY_ANSWERED, decideClarify, hasAskBlock, isAnswersMessage, plainAsk, withAnsweredNote } from "./clarify.js";
 import { classifyOutput, modeDirective } from "./output-mode.js";
@@ -482,9 +483,12 @@ export async function sendMessage(
       sections.push({ id: "documents", text: documentContext.body ?? documentContext.text, tail: documentContext.rules, floorTokens: 300, shedOrder: 40 });
     }
 
-    const knowledgeTreeContext = buildKnowledgeTreeContext(taskText, knowledgeNodes);
-    if (knowledgeTreeContext) {
-      sections.push({ id: "knowledge-tree", text: knowledgeTreeContext, floorTokens: 180, shedOrder: 45 });
+    // The tree entries are labelled T1, T2… so the answer can cite them. They become sources only if the answer does
+    // cite them (see keepCitedTreeSources below).
+    const knowledgeTree = buildKnowledgeTreeSources(taskText, knowledgeNodes);
+    if (knowledgeTree.text) {
+      sections.push({ id: "knowledge-tree", text: knowledgeTree.text, floorTokens: 180, shedOrder: 45 });
+      citations = [...citations, ...knowledgeTree.citations];
     }
 
     // What the user asked Lirava to remember about them (settings → Memory). Shed early if the prompt is too long.
@@ -548,6 +552,9 @@ export async function sendMessage(
     // The user has just answered a question card: use the answers, do not ask again (see clarify.ts).
     if (isAnswersMessage(userText)) sections.push({ id: "clarify", text: CLARIFY_ANSWERED, shedOrder: 100 });
     if (outputMode) sections.push({ id: "output-mode", text: modeDirective(outputMode), shedOrder: 100 });
+    // An answer to a question starts with its bottom line and ends with its gaps (see answer-format.ts); a document or plan does not.
+    const formatInstruction = answerFormatSection(outputMode);
+    if (formatInstruction) sections.push({ id: "answer-format", text: formatInstruction, floorTokens: 150, shedOrder: 97 });
 
     // The model reads a card it asked as one plain line, and an answer to a card with an instruction to go ahead.
     const modelHistory = cleanHistory.map((t) => ({ ...t, content: plainAsk(t.content) }));
@@ -749,7 +756,7 @@ export async function sendMessage(
         // Stopped by the user (or replaced by a newer message): keep the part already written instead of losing it.
         if (assistantText.trim()) {
           asstMsg.text = assistantText;
-          await insertMessage({ id: asstMsg.id, conversationId, userId, vakilId, role: "vakil", text: assistantText, citations, createdAt: asstMsg.createdAt }).catch(() => undefined);
+          await insertMessage({ id: asstMsg.id, conversationId, userId, vakilId, role: "vakil", text: assistantText, citations: keepCitedTreeSources(citations, assistantText), createdAt: asstMsg.createdAt }).catch(() => undefined);
           emit({ type: "message", vakilId, userId, data: asstMsg });
         }
         throw llmErr;
@@ -853,6 +860,10 @@ export async function sendMessage(
         asstMsg.text = redone;
       }
     }
+
+    // Only the case-tree entries the final answer cites are shown as sources; the saved and the live message agree.
+    citations = keepCitedTreeSources(citations, assistantText);
+    asstMsg.citations = citations.length ? citations : null;
 
     // Check every case and section the answer names against the legal library. Nothing the model typed is trusted:
     // a citation is "verified" only when it matches a library record. The result travels beside the answer as its own

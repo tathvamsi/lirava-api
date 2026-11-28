@@ -1,4 +1,5 @@
 import type { NodeKind, NodeStatus } from "./index.js";
+import { isPlaceholder } from "./context.js";
 
 export interface HandoverIntake {
   brief: string;
@@ -39,9 +40,15 @@ export function buildOnboardingNodes(matter: OnboardingMatter): OnboardingNode[]
     const value = clean(title, 300);
     if (value) nodes.push({ section, kind, title: value, status: "confirmed", ...extra });
   };
+  // "Yet to know", "N/A" and the like mean the lawyer has nothing to record yet: leave the entry out instead of storing
+  // the placeholder as a confirmed name that every later answer would repeat as fact.
+  const known = (value: string, max: number) => {
+    const text = clean(value, max);
+    return isPlaceholder(text) ? "" : text;
+  };
 
-  if (clean(matter.client, 200)) add("Parties", "party", `Client: ${clean(matter.client, 200)}`);
-  if (clean(intake.oppositeParty, 200)) add("Parties", "party", `Opposite party: ${clean(intake.oppositeParty, 200)}`);
+  if (known(matter.client, 200)) add("Parties", "party", `Client: ${known(matter.client, 200)}`);
+  if (known(intake.oppositeParty, 200)) add("Parties", "party", `Opposite party: ${known(intake.oppositeParty, 200)}`);
   if (clean(intake.brief, 5000)) add("Facts", "fact", "Case summary", { body: clean(intake.brief, 5000) });
   if (clean(intake.caseType, 80)) add("Facts", "fact", `Case type: ${clean(intake.caseType, 80)}`);
   if (clean(matter.court, 200)) add("Facts", "fact", `Court / forum: ${clean(matter.court, 200)}`);
